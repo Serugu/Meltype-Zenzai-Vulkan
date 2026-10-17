@@ -1,5 +1,5 @@
 ﻿# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Yukishiro
+# Copyright (C) 2026 Serugu
 #
 # インストール済みの Meltype (%LOCALAPPDATA%\Programs\Meltype) を、Zenzai を足したこのリポジトリのビルドに差し替える。
 #   - Meltype.dll / Meltype.Core.dll を入れ替える (前の DLL は %LOCALAPPDATA%\Meltype\zenzai-backup\ に控える)

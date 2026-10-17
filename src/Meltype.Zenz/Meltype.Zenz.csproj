@@ -9,8 +9,8 @@
     <RootNamespace>Meltype.Zenz</RootNamespace>
     <Version>1.2.1</Version>
     <Product>Meltype</Product>
-    <Authors>Yukishiro</Authors>
-    <Copyright>Copyright (C) 2026 雪代 / Yukishiro. GPL-3.0-or-later</Copyright>
+    <Authors>Serugu</Authors>
+    <Copyright>Copyright (C) 2026 Serugu. GPL-3.0-or-later</Copyright>
     <Description>zenz (azooKey の Zenzai のモデル) で Mozc の候補を選び直すヘルパー</Description>
     <!-- 常駐するので小さくする: 文化圏のデータ (ICU) を読まない・GC の裏のスレッドを作らない -->
     <InvariantGlobalization>true</InvariantGlobalization>
