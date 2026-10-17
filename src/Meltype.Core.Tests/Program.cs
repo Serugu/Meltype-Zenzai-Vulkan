@@ -69,6 +69,10 @@ internal static class Program
                 Jht.Batch(null, Henkan.Keyboard, () => Henkan.EngineName);
                 Henkan.Shutdown();
                 return 0;
+            case "--zenzai-check":
+                // --zenzai-check <Meltype.Zenz.exe> [vulkan|cpu]: アプリと同じ待ち時間 (80ms) で Zenzai を動かし、
+                // 起動・選び直しの速さ・ヘルパーが落ちたときに Mozc に戻ってから起動し直すことを確かめる
+                return ZenzaiCheck.Run(args[1], args.ElementAtOrDefault(2) ?? "vulkan");
             case "--explain":
                 if (Environment.GetEnvironmentVariable("MELTYPE_UTF8") == "1") Console.OutputEncoding = new System.Text.UTF8Encoding(false);
                 TestHost.Explain(args.Skip(1));

@@ -29,6 +29,8 @@ internal sealed class CompositionService : ICompositionHost, IDisposable
     // Mozc (同梱の mozc/meltype_mozc_helper.exe) と Microsoft IME を組み合わせた変換エンジン。
     private readonly MozcConverter _mozc = new(Path.Combine(AppContext.BaseDirectory, "mozc", "meltype_mozc_helper.exe"), Path.Combine(Config.AppPaths.DataDirectory, "mozc"));
     private HybridConverter _hybrid = null!;
+    // Zenzai (同梱の zenz/Meltype.Zenz.exe)。Mozc の文節ごとの候補を zenz で選び直す。
+    private ZenzaiReranker? _zenzai;
     private readonly IME.Imm32ImeController _imm32 = new();
     private readonly System.Windows.Forms.Timer _tick = new() { Interval = 100 };
     private int _pumpScheduled;
@@ -81,11 +83,14 @@ internal sealed class CompositionService : ICompositionHost, IDisposable
         };
         Phrases = resolved.Predictor?.Phrases;
         TranslationHistory = resolved.TranslationHistory;
-        _hybrid = new HybridConverter(options.Engine, _mozc, _converter, reading => _windowsCandidates.Get(reading));
+        var zenzaiOptions = options.ZenzaiOptions ?? (() => new ZenzaiOptions(ZenzaiOptions.DefaultModelPath, "vulkan", 10, 80));
+        _zenzai = new ZenzaiReranker(Path.Combine(AppContext.BaseDirectory, "zenz", "Meltype.Zenz.exe"), zenzaiOptions);
+        _hybrid = new HybridConverter(options.Engine, _mozc, _converter, reading => _windowsCandidates.Get(reading), _zenzai, options.Zenzai);
         _resolved = resolved;
         Controller = new CompositionController(Gate, detector, _hybrid, this, resolved);
         Controller.Corrected += Corrections.Add;
         if (options.Engine() != Config.ConversionEngine.System && _mozc.IsInstalled) _mozc.WarmUp();
+        if (options.Zenzai() && options.Engine() != Config.ConversionEngine.System) _zenzai.WarmUp();
         _showIndicator = options.ModeIndicator;
         _placement = options.Placement;
         _size = options.Size;
@@ -798,6 +803,7 @@ internal sealed class CompositionService : ICompositionHost, IDisposable
         _converter.Dispose();
         _windowsCandidates.Dispose();
         _mozc.Dispose();
+        _zenzai?.Dispose();
         _window.Dispose();
         _indicator.Dispose();
     }

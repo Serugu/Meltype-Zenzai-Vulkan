@@ -19,6 +19,15 @@ Meltype のソースコード (このリポジトリ) には、他者の著作�
 | [swift-collections](https://github.com/apple/swift-collections)・[swift-algorithms](https://github.com/apple/swift-algorithms)・[swift-numerics](https://github.com/apple/swift-numerics) (Apple) | Apache License 2.0 | AzooKeyKanaKanjiConverter が使う部品として、一緒に Meltype.app に組み込まれる (`mac/Package.resolved` で版を固定) |
 | [Jinja](https://github.com/johnmai-dev/Jinja)・[swift-tokenizers](https://github.com/ensan-hcl/swift-tokenizers) | Apache License 2.0 | AzooKeyKanaKanjiConverter が依存する部品 (`mac/Package.resolved` で版を固定)。組み込まれる場合は、ライセンス表示を同梱する |
 
+## Zenzai (zenzai ブランチの Windows 版) が使うもの
+
+| 部品 | ライセンス | 使い方 |
+| --- | --- | --- |
+| [LLamaSharp](https://github.com/SciSharp/LLamaSharp) (LLamaSharp・LLamaSharp.Backend.Vulkan.Windows・LLamaSharp.Backend.Cpu 0.30.0) | MIT License | zenz のヘルパー (`src/Meltype.Zenz`) が NuGet から取り込み、`zenz\` に同梱する |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp)・ggml | MIT License | LLamaSharp のネイティブのライブラリ (llama.dll・ggml*.dll) として `zenz\` に同梱する |
+| .NET ランタイム | MIT License | zenz のヘルパーを自己完結で発行するので、`zenz\` に同梱する |
+| [zenz-v3.2-small](https://huggingface.co/Miwa-Keita/zenz-v3.2-small-gguf) (Miwa-Keita、azooKey の Zenzai のモデル) | Apache License 2.0 | 同梱しない。`tools/Install-Zenzai.ps1` が Hugging Face から `%LOCALAPPDATA%\Meltype\zenz\` へ取ってくる |
+
 ## 実行時に使う Windows の機能 (同梱しない)
 
 次は Windows に標準で入っているものを実行時に呼び出すだけで、Meltype には含まれません。

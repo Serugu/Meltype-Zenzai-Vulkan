@@ -193,6 +193,7 @@ internal static class Henkan
     /// <summary>終わるときに、Mozc の変換ヘルパーを止めて、学習データの場所を消す。</summary>
     public static void Shutdown()
     {
+        if (Zenzai.IsValueCreated) Zenzai.Value?.Dispose();
         if (Mozc.IsValueCreated) Mozc.Value?.Dispose();
         try { if (Directory.Exists(ProfileDirectory)) Directory.Delete(ProfileDirectory, recursive: true); } catch { }
     }
@@ -201,18 +202,42 @@ internal static class Henkan
     public static void Reset()
     {
         if (Mozc.IsValueCreated) Mozc.Value?.ClearCache();
+        if (Zenzai.IsValueCreated) Zenzai.Value?.ClearCache();
     }
 
     private static readonly Lazy<Composition.MozcConverter?> Mozc = new(() =>
         Environment.GetEnvironmentVariable("MELTYPE_MOZC") is { Length: > 0 } helper && File.Exists(helper)
             ? new Composition.MozcConverter(helper, ProfileDirectory)
             : null);
+
+    /// <summary>
+    /// 環境変数 MELTYPE_ZENZ に zenz のヘルパー (Meltype.Zenz.exe) の場所があれば、Mozc の候補を Zenzai で選び直す。
+    /// 結果が毎回同じになるよう、準備ができるまで待ち、1 回の選び直しも長めに待つ (アプリは 80ms で諦めて Mozc の結果を使う)。
+    /// MELTYPE_ZENZ_BACKEND (vulkan / cpu)・MELTYPE_ZENZ_MODEL で装置と重みを変えられる。
+    /// </summary>
+    private static readonly Lazy<Composition.ZenzaiReranker?> Zenzai = new(() =>
+    {
+        if (Environment.GetEnvironmentVariable("MELTYPE_ZENZ") is not { Length: > 0 } helper || !File.Exists(helper) || Mozc.Value is null) return null;
+        var options = new Composition.ZenzaiOptions(
+            Environment.GetEnvironmentVariable("MELTYPE_ZENZ_MODEL") is { Length: > 0 } model ? model : Composition.ZenzaiOptions.DefaultModelPath,
+            Environment.GetEnvironmentVariable("MELTYPE_ZENZ_BACKEND") is { Length: > 0 } backend ? backend : "vulkan", 0, 5000);
+        var zenzai = new Composition.ZenzaiReranker(helper, () => options);
+        if (!zenzai.WaitUntilReady(60000)) throw new InvalidOperationException("Zenzai を起動できませんでした (MELTYPE_ZENZ と重みの場所を確かめてください)");
+        return zenzai;
+    });
+
+    /// <summary>Zenzai を Mozc とつなぐときの、OS の変換エンジンの代わり (使わない)。</summary>
+    private sealed class NoConverter : Composition.IKanjiConverter
+    {
+        public string? Convert(string hiragana) => null;
+        public IReadOnlyList<Composition.ConversionClause>? ConvertClauses(string hiragana, string? context = null) => null;
+    }
     private static readonly Lazy<Composition.TranslationDictionary> Translations = new(Composition.TranslationDictionary.Load);
 
     /// <summary>Windows のテストランナーが Microsoft IME を変換エンジンにするとき (Mozc が無いとき) に入れる。</summary>
     public static Composition.IKanjiConverter? FallbackConverter { get; set; }
 
-    public static string EngineName => Mozc.Value is not null ? "Mozc" : FallbackConverter is not null ? "Microsoft IME" : "なし (判定だけ)";
+    public static string EngineName => Mozc.Value is not null ? (Zenzai.Value is not null ? "Mozc + Zenzai" : "Mozc") : FallbackConverter is not null ? "Microsoft IME" : "なし (判定だけ)";
 
     /// <summary>アプリと同じ設定の Meltype キーボード (ライブ変換 ON、Mozc があれば Mozc で変換)。</summary>
     public static CompositionTests.Keyboard Keyboard()
@@ -220,7 +245,11 @@ internal static class Henkan
         CompositionTests.Detector.SpellChecker ??= Detection.BuiltInWordChecker.Shared;
         // Mozc には覚えさせない (覚えさせると、前の打ち方・前の文で確定した変換が次の打ち方の結果を変えてしまう。
         // 確かめたいのは、まだ何も覚えていない人の最初の変換)
-        var converter = Mozc.Value is { } engine ? new WithoutLearning(engine) : FallbackConverter;
+        Composition.IKanjiConverter? converter = Mozc.Value is { } engine
+            ? new WithoutLearning(Zenzai.Value is { } zenzai
+                ? new Composition.HybridConverter(() => Config.ConversionEngine.Mozc, engine, new NoConverter(), null, zenzai, () => true)
+                : engine)
+            : FallbackConverter;
         return new(live: true, converter: converter, moreCandidates: Mozc.Value is { } mozc ? mozc.Candidates : null,
             userDictionary: new Composition.UserDictionary(null), translations: Translations.Value);
     }

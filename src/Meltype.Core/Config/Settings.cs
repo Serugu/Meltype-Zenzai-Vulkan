@@ -83,6 +83,13 @@ public enum ConversionEngine
     [Description("Microsoft IME")] System,
 }
 
+/// <summary>Zenzai (zenz) の計算に使う装置。</summary>
+public enum ZenzaiBackend
+{
+    [Description("GPU (Vulkan)")] Vulkan,
+    [Description("CPU")] Cpu,
+}
+
 /// <summary>句読点の組み合わせ (Microsoft IME と同じ 4 通り)。, と . を打ったときに出す文字。</summary>
 public enum PunctuationStyle
 {
@@ -236,6 +243,22 @@ public sealed class Settings
     [Category("1. 全般"), DisplayName("変換エンジン"),
      Description("かな漢字変換に使うエンジン。「両方」は Mozc (Google 日本語入力のオープンソース版) で変換し、Mozc が使えないときは Microsoft IME で変換します。候補には両方の候補が出ます。")]
     public ConversionEngine ConversionEngine { get; set; } = ConversionEngine.Hybrid;
+
+    [Category("1. 全般"), DisplayName("Zenzai (ニューラル変換)"),
+     Description("Mozc の文節ごとの候補から、zenz (azooKey の Zenzai のかな漢字変換モデル) が文全体と前の文の流れに合う組み合わせを選び直します (感じ変換の制度 → 漢字変換の精度)。変換エンジンが「両方」か「Mozc」のときに効きます。重み (zenz-v3.2-small) は %LOCALAPPDATA%\\Meltype\\zenz\\ に置きます。間に合わないときは Mozc の結果のまま入ります。")]
+    public bool Zenzai { get; set; }
+
+    [Category("1. 全般"), DisplayName("Zenzai の計算に使う装置"),
+     Description("GPU (Vulkan) は 1 回の選び直しが 10〜20ms ほどで、VRAM を 150MB ほど使います。CPU は GPU を使いませんが、数倍遅くなります。")]
+    public ZenzaiBackend ZenzaiBackend { get; set; } = ZenzaiBackend.Vulkan;
+
+    [Category("1. 全般"), DisplayName("Zenzai を休ませるまでの時間 (分)"),
+     Description("この時間打たなかったら Zenzai を止めて、VRAM とメモリを空けます。次に打ったときに数秒で起動し直します (そのあいだは Mozc の結果)。0 にすると止めません。")]
+    public int ZenzaiIdleExitMinutes { get; set; } = 10;
+
+    [Category("1. 全般"), DisplayName("Zenzai を待つ時間 (ms)"),
+     Description("1 回の選び直しを待つ時間です。間に合わなかったら Mozc の結果を見せ、zenz の結果は次のキーで使います。長くすると打ったときの反応が遅れることがあります。")]
+    public int ZenzaiTimeoutMs { get; set; } = 80;
 
     [Category("1. 全般"), DisplayName("英訳の候補"),
      Description("変換の候補の後ろに英訳も出します (複雑な → complex, complicated)。JMdict のよく使う語から。選んだ英訳は少しずつ前に出ます。")]
@@ -702,6 +725,8 @@ public sealed class Settings
         SessionIdleMs = Math.Clamp(SessionIdleMs, 300, 60000);
         FeedbackWindowMs = Math.Clamp(FeedbackWindowMs, 500, 30000);
         ImeTimeoutMs = Math.Clamp(ImeTimeoutMs, 50, 2000);
+        ZenzaiIdleExitMinutes = Math.Clamp(ZenzaiIdleExitMinutes, 0, 1440);
+        ZenzaiTimeoutMs = Math.Clamp(ZenzaiTimeoutMs, 10, 1000);
         AppRules ??= [];
         AppKinds ??= [];
         AppRules.RemoveAll(r => r is null || string.IsNullOrWhiteSpace(r.Process));

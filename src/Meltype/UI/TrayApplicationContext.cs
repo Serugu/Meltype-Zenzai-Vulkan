@@ -57,6 +57,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
             AutoCorrect = () => _engine.Settings.AutoCorrectAfterCommit && _engine.AppSettings.DetectionLevel != DetectionLevel.Manual,
             Level = () => _engine.AppSettings.DetectionLevel,
             Engine = () => _engine.Settings.ConversionEngine,
+            Zenzai = () => _engine.Settings.Zenzai,
+            ZenzaiOptions = () => Composition.ZenzaiOptions.From(_engine.Settings),
             TranslationCandidates = () => _engine.Settings.TranslationCandidates,
             CandidateMeanings = () => _engine.Settings.ShowCandidateMeanings,
             ShowTypedKeys = () => _engine.Settings.ShowTypedKeys,

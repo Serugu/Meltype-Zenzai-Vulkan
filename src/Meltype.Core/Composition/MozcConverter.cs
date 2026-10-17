@@ -69,6 +69,10 @@ public sealed class MozcConverter : IKanjiConverter, ILearningConverter, IDispos
         return segments.Select(s => new ConversionClause(s.Reading, s.Candidates.FirstOrDefault() ?? s.Reading)).ToList();
     }
 
+    /// <summary>文節ごとの読みと候補 (Mozc の順)。変換できなければ null。Zenzai が候補を選び直すのに使う。</summary>
+    internal IReadOnlyList<(string Reading, IReadOnlyList<string> Candidates)>? Segments(string hiragana, string? context = null) =>
+        Request(context ?? "", hiragana);
+
     /// <summary>読みの変換候補 (多い順)。直前の変換で同じ読みの文節があればその候補、無ければその読みだけで変換する。</summary>
     public IReadOnlyList<string> Candidates(string reading)
     {

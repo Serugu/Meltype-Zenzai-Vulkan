@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Yukishiro
+
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Meltype.Composition;
+
+/// <summary>Zenzai (zenz のヘルパー) の起動のしかた。</summary>
+/// <param name="ModelPath">zenz の重み (gguf)。</param>
+/// <param name="Backend">vulkan / cpu。</param>
+/// <param name="IdleExitMinutes">使わない時間がこれだけ続いたら、ヘルパーが終了して VRAM・メモリを空ける (0 なら終了しない)。</param>
+/// <param name="TimeoutMs">1 回の選び直しを待つ時間。間に合わなければ Mozc の結果を使う (変換は UI スレッドで動くので短くする)。</param>
+public sealed record ZenzaiOptions(string ModelPath, string Backend, int IdleExitMinutes, int TimeoutMs)
+{
+    /// <summary>重みの既定の置き場所 (%LOCALAPPDATA%\Meltype\zenz\)。</summary>
+    public static string DefaultModelPath => Path.Combine(Config.AppPaths.DataDirectory, "zenz", "zenz-v3.2-small-Q5_K_M.gguf");
+
+    /// <summary>設定の値から作る。</summary>
+    public static ZenzaiOptions From(Config.Settings settings) => new(DefaultModelPath,
+        settings.ZenzaiBackend == Config.ZenzaiBackend.Cpu ? "cpu" : "vulkan", settings.ZenzaiIdleExitMinutes, settings.ZenzaiTimeoutMs);
+}
+
+/// <summary>
+/// zenz (azooKey の Zenzai のかな漢字変換モデル) で、Mozc の文節ごとの候補から組み合わせを選び直す。
+/// 同梱のヘルパー (zenz\Meltype.Zenz.exe、llama.cpp で GPU 推論) を別のプロセスで動かし、標準入出力で頼む。
+///
+/// やり取り (UTF-8、1 行ずつ): 「E[TAB]前の文字列[TAB]読み[TAB]文節1の候補1[US]候補2…[RS]文節2の候補…」を送ると、
+/// 文節ごとに選んだ候補の番号を [US] でつないだ 1 行が返る (選べなければ空行)。
+/// ヘルパーの起動 (重みの読み込みと GPU の準備) はバックグラウンドで行い、そのあいだや、応答が遅い・失敗したときは null を返す
+/// (呼び出し側は Mozc の 1 番目の候補を使う)。ヘルパーは使わない時間が続くと自分で終了するので、次に頼まれたら起動し直す。
+/// </summary>
+public sealed class ZenzaiReranker : IDisposable
+{
+    private const char UnitSeparator = '\x1f';
+    private const char RecordSeparator = '\x1e';
+    private const int StartTimeoutMs = 60000;
+
+    private readonly string _helperPath;
+    private readonly Func<ZenzaiOptions> _options;
+    private readonly object _gate = new();
+    private readonly Dictionary<string, int[]?> _results = new(StringComparer.Ordinal);
+    private Process? _process;
+    private ZenzaiOptions? _startedWith;
+    private Task? _starting;
+    // 待ちきれなかった頼み (その頼みの控えのキーと、返事を読む Task)。返事が来たら控えに入れ、来るまでは次を頼まない
+    private (string Key, Task<string?> Reply)? _pending;
+    private int _failures;
+    private bool _missingDependency;
+    private bool _disposed;
+
+    private const uint SEM_FAILCRITICALERRORS = 0x0001;
+    private const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetErrorMode(uint mode);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetErrorMode();
+
+    private static bool IsLoaderFailure(int exitCode) => exitCode is unchecked((int)0xC0000135) or unchecked((int)0xC0000139) or unchecked((int)0xC000007B);
+
+    /// <param name="helperPath">Meltype.Zenz の実行ファイル。</param>
+    /// <param name="options">起動のしかた (設定が変わったら、次に頼むときに起動し直す)。</param>
+    public ZenzaiReranker(string helperPath, Func<ZenzaiOptions> options)
+    {
+        _helperPath = helperPath;
+        _options = options;
+    }
+
+    /// <summary>ヘルパーと重みがあるか。</summary>
+    public bool IsInstalled => File.Exists(_helperPath) && File.Exists(_options().ModelPath);
+
+    /// <summary>使えるか。何度も失敗したら諦める。</summary>
+    public bool IsAvailable => IsInstalled && _failures < 3 && !_missingDependency;
+
+    /// <summary>
+    /// 文節ごとに選んだ候補の番号。準備中・間に合わない・失敗したときは null。
+    /// candidates は文節ごとの候補 (Mozc の順。どの文節にも 1 つ以上ある)。
+    /// </summary>
+    public int[]? Choose(string? context, string reading, IReadOnlyList<IReadOnlyList<string>> candidates)
+    {
+        if (candidates.Count == 0 || candidates.Any(c => c.Count == 0)) return null;
+        if (candidates.All(c => c.Count == 1)) return new int[candidates.Count];
+        if (!IsAvailable) return null;
+        var request = $"E\t{Clean(context ?? "")}\t{Clean(reading)}\t{string.Join(RecordSeparator, candidates.Select(c => string.Join(UnitSeparator, c.Select(Clean))))}";
+        lock (_gate)
+        {
+            if (_disposed) return null;
+            if (_results.TryGetValue(request, out var known)) return known;
+            if (Ready() is not { } process) return null;
+            if (!CollectPending(0)) return null;
+            if (_results.TryGetValue(request, out known)) return known;
+            try
+            {
+                var reply = process.StandardOutput.ReadLineAsync();
+                process.StandardInput.Write(request + "\n");
+                process.StandardInput.Flush();
+                var timeout = Math.Max(10, _options().TimeoutMs);
+                if (!reply.Wait(timeout))
+                {
+                    // 遅かった。返事はあとで控えに入れる (同じ読みはライブ変換で何度も頼まれるので、次のキーで使える)
+                    _pending = (request, reply);
+                    return null;
+                }
+                return Remember(request, Parse(reply.Result, candidates.Count));
+            }
+            catch (Exception ex)
+            {
+                Diagnostics.Log.Warn($"Zenzai を使えませんでした: {ex.Message}");
+                Fail();
+                return null;
+            }
+        }
+    }
+
+    /// <summary>起動しておく (重みの読み込みと GPU の準備に数秒かかるので、最初の変換の前に)。</summary>
+    public void WarmUp()
+    {
+        if (!IsAvailable) return;
+        lock (_gate) Ready();
+    }
+
+    /// <summary>起動して、準備ができるまで待つ (テストの道具用。アプリでは WarmUp を使い、待たない)。</summary>
+    public bool WaitUntilReady(int timeoutMs)
+    {
+        Task? starting;
+        lock (_gate)
+        {
+            if (Ready() is not null) return true;
+            starting = _starting;
+        }
+        starting?.Wait(timeoutMs);
+        lock (_gate) return _process is { HasExited: false };
+    }
+
+    /// <summary>選んだ結果の控えを捨てる (Mozc が覚えて候補の順番が変わったときなど)。</summary>
+    public void ClearCache()
+    {
+        lock (_gate) _results.Clear();
+    }
+
+    /// <summary>待ちきれなかった返事が来ていれば控えに入れる (_gate の中で呼ぶ)。まだ来ていなければ false。</summary>
+    private bool CollectPending(int waitMs)
+    {
+        if (_pending is not { } pending) return true;
+        try
+        {
+            if (!pending.Reply.Wait(waitMs)) return false;
+            var count = pending.Key.Split('\t')[3].Split(RecordSeparator).Length;
+            Remember(pending.Key, Parse(pending.Reply.Result, count));
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.Log.Warn($"Zenzai の応答を読めませんでした: {ex.Message}");
+            Fail();
+            return false;
+        }
+        finally
+        {
+            if (pending.Reply.IsCompleted) _pending = null;
+        }
+        return true;
+    }
+
+    private static int[]? Parse(string? line, int count)
+    {
+        if (string.IsNullOrEmpty(line)) return null;
+        var fields = line.Split(UnitSeparator);
+        if (fields.Length != count) return null;
+        var picks = new int[count];
+        for (var i = 0; i < count; i++)
+        {
+            if (!int.TryParse(fields[i], out picks[i]) || picks[i] < 0) return null;
+        }
+        return picks;
+    }
+
+    private int[]? Remember(string key, int[]? picks)
+    {
+        if (_results.Count > 512) _results.Clear();
+        _results[key] = picks;
+        return picks;
+    }
+
+    // タブ・改行・区切りの文字はやり取りに使うので空白にする
+    private static string Clean(string text) =>
+        text.Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' ').Replace(UnitSeparator, ' ').Replace(RecordSeparator, ' ');
+
+    /// <summary>
+    /// 準備のできたヘルパー (_gate の中で呼ぶ)。動いていなければバックグラウンドで起動して null を返す。
+    /// 使わない時間が続いてヘルパーが自分で終了したときも、ここで起動し直す。
+    /// </summary>
+    private Process? Ready()
+    {
+        var options = _options();
+        if (_process is { HasExited: false } running && options == _startedWith) return running;
+        if (_starting is { IsCompleted: false }) return null;
+        if (_process is { } old)
+        {
+            if (options != _startedWith)
+            {
+                Diagnostics.Log.Info("Zenzai の設定が変わったので起動し直します。");
+                Stop(old);
+            }
+            else if (old.HasExited && old.ExitCode != 0)
+            {
+                Diagnostics.Log.Warn($"Zenzai のヘルパーが終了していました (終了コード 0x{old.ExitCode:X8})。");
+                _failures++;
+            }
+            old.Dispose();
+            _process = null;
+            _pending = null;
+            _results.Clear();
+        }
+        if (!IsAvailable) return null;
+        _starting = Task.Run(() => StartProcess(options));
+        return null;
+    }
+
+    private void StartProcess(ZenzaiOptions options)
+    {
+        Process? process = null;
+        try
+        {
+            var info = new ProcessStartInfo(_helperPath)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardInputEncoding = new UTF8Encoding(false),
+                StandardOutputEncoding = new UTF8Encoding(false),
+                WorkingDirectory = Path.GetDirectoryName(_helperPath) ?? "",
+            };
+            foreach (var arg in new[] { "--model", options.ModelPath, "--backend", options.Backend, "--idle-exit", options.IdleExitMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) })
+            {
+                info.ArgumentList.Add(arg);
+            }
+            var previousMode = 0u;
+            if (OperatingSystem.IsWindows())
+            {
+                previousMode = GetErrorMode();
+                SetErrorMode(previousMode | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+            }
+            try
+            {
+                process = Process.Start(info) ?? throw new InvalidOperationException("起動できませんでした");
+            }
+            finally
+            {
+                if (OperatingSystem.IsWindows()) SetErrorMode(previousMode);
+            }
+            // llama.cpp のログ (標準エラー) は読み捨てる (溜まるとヘルパーが止まる)
+            process.ErrorDataReceived += (_, _) => { };
+            process.BeginErrorReadLine();
+            var ready = process.StandardOutput.ReadLineAsync();
+            var line = ready.Wait(StartTimeoutMs) ? ready.Result : null;
+            if (line is null || !line.StartsWith("READY", StringComparison.Ordinal))
+            {
+                if (process.WaitForExit(1000) && IsLoaderFailure(process.ExitCode)) _missingDependency = true;
+                throw new InvalidOperationException(line ?? "応答なし");
+            }
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    Stop(process);
+                    return;
+                }
+                _process = process;
+                _startedWith = options;
+                _failures = 0;
+            }
+            Diagnostics.Log.Info($"Zenzai を起動しました ({line[5..].Trim()})。");
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.Log.Warn($"Zenzai を起動できませんでした: {ex.Message}。Mozc の結果で変換します。");
+            if (process is not null) Stop(process);
+            lock (_gate) _failures++;
+        }
+    }
+
+    private void Fail()
+    {
+        _failures++;
+        if (_process is { } process) Stop(process);
+        _process = null;
+        _pending = null;
+    }
+
+    private static void Stop(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.StandardInput.Write("Q\n");
+                process.StandardInput.Flush();
+                if (!process.WaitForExit(1000)) process.Kill();
+            }
+        }
+        catch
+        {
+        }
+        process.Dispose();
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            _disposed = true;
+            if (_process is { } process) Stop(process);
+            _process = null;
+        }
+    }
+}

@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Meltype.Zenz</AssemblyName>
+    <RootNamespace>Meltype.Zenz</RootNamespace>
+    <Version>1.2.1</Version>
+    <Product>Meltype</Product>
+    <Authors>Yukishiro</Authors>
+    <Copyright>Copyright (C) 2026 雪代 / Yukishiro. GPL-3.0-or-later</Copyright>
+    <Description>zenz (azooKey の Zenzai のモデル) で Mozc の候補を選び直すヘルパー</Description>
+    <!-- 常駐するので小さくする: 文化圏のデータ (ICU) を読まない・GC の裏のスレッドを作らない -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LLamaSharp" Version="0.30.0" />
+    <PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.30.0" />
+    <PackageReference Include="LLamaSharp.Backend.Vulkan.Windows" Version="0.30.0" />
+  </ItemGroup>
+
+</Project>
