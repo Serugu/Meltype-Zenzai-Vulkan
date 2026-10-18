@@ -46,6 +46,93 @@ internal static class ZenzaiTests
     }
 }
 
+/// <summary>
+/// --zenzai-live: ライブ変換のように読みを 1 文字ずつ伸ばして (4 文字から)、Zenzai なし・あり (かなの文節も変える)・あり (かなの文節は変えない)
+/// の 3 通りで変換し、打っている途中で漢字が増える回数と、読み全体の正解数を比べる (MELTYPE_MOZC が要る。調べる用)。
+/// 結果が毎回同じになるよう、選び直しは長めに待つ。
+/// </summary>
+internal static class ZenzaiLiveCheck
+{
+    public static int Run(string helper, IEnumerable<string> files)
+    {
+        Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+        if (Environment.GetEnvironmentVariable("MELTYPE_MOZC") is not { Length: > 0 } mozcPath || !File.Exists(mozcPath))
+        {
+            Console.WriteLine("MELTYPE_MOZC に Mozc の変換ヘルパーの場所を入れてください");
+            return 1;
+        }
+        using var mozc = new MozcConverter(mozcPath, Path.Combine(Path.GetTempPath(), $"meltype-zenzai-live-{Environment.ProcessId}"));
+        var options = new ZenzaiOptions(ZenzaiOptions.DefaultModelPath, "vulkan", 0, 5000, LiveTimeoutMs: 5000);
+        using var zenzai = new ZenzaiReranker(helper, () => options);
+        if (!zenzai.WaitUntilReady(60000)) return 1;
+        var hybrid = new HybridConverter(() => Config.ConversionEngine.Mozc, mozc, new NoConverter(), null, zenzai, () => true) { Live = true };
+
+        List<ConversionClause> Clauses(string reading, bool zenz, bool keepKana)
+        {
+            hybrid.LiveKeepsKana = keepKana;
+            return (zenz ? hybrid.ConvertClauses(reading) : mozc.ConvertClauses(reading))?.ToList() ?? [new ConversionClause(reading, reading)];
+        }
+        string Convert(string reading, bool zenz, bool keepKana) => string.Concat(Clauses(reading, zenz, keepKana).Select(c => c.Text));
+        // Mozc ではかなのままの文節を、zenz が漢字などにした (区切りは同じなので、文節ごとに比べる)
+        static bool KanaTurnedToKanji(List<ConversionClause> mozc, List<ConversionClause> zenz) =>
+            mozc.Count == zenz.Count && mozc.Zip(zenz).Any(p => HybridConverter.IsKanaOnly(p.First.Text) && !HybridConverter.IsKanaOnly(p.Second.Text));
+        static bool LastKanaTurnedToKanji(List<ConversionClause> mozc, List<ConversionClause> zenz) =>
+            mozc.Count == zenz.Count && HybridConverter.IsKanaOnly(mozc[^1].Text) && !HybridConverter.IsKanaOnly(zenz[^1].Text);
+
+        int prefixes = 0, moreKanjiOn = 0, moreKanjiFixed = 0, lastOn = 0, sentences = 0, offOk = 0, onOk = 0, fixedOk = 0;
+        var examples = new List<string>();
+        foreach (var file in files)
+        {
+            foreach (var line in File.ReadLines(file))
+            {
+                var slash = line.IndexOf(" / ", StringComparison.Ordinal);
+                if (slash < 0) continue;
+                var answers = line[..slash].Split('|');
+                var reading = line[(slash + 3)..].Trim();
+                for (var length = 4; length <= reading.Length; length++)
+                {
+                    var prefix = reading[..length];
+                    var offClauses = Clauses(prefix, false, false);
+                    var onClauses = Clauses(prefix, true, false);
+                    var keptClauses = Clauses(prefix, true, true);
+                    var off = string.Concat(offClauses.Select(c => c.Text));
+                    var on = string.Concat(onClauses.Select(c => c.Text));
+                    var kept = string.Concat(keptClauses.Select(c => c.Text));
+                    if (length < reading.Length)
+                    {
+                        prefixes++;
+                        if (KanaTurnedToKanji(offClauses, onClauses))
+                        {
+                            moreKanjiOn++;
+                            if (LastKanaTurnedToKanji(offClauses, onClauses)) lastOn++;
+                            if (examples.Count < 15) examples.Add($"    {prefix}: なし={off}  あり={on}  直した後={kept}");
+                        }
+                        if (KanaTurnedToKanji(offClauses, keptClauses)) moreKanjiFixed++;
+                    }
+                    else
+                    {
+                        sentences++;
+                        if (answers.Contains(off)) offOk++;
+                        if (answers.Contains(on)) onOk++;
+                        if (answers.Contains(kept)) fixedOk++;
+                        if (answers.Contains(on) != answers.Contains(kept)) examples.Add($"  読み全体: {reading}: あり={on}  直した後={kept}");
+                    }
+                }
+            }
+        }
+        Console.WriteLine($"打っている途中 {prefixes} 回のうち、Mozc ではかなの文節を zenz が漢字などにした回数: あり {moreKanjiOn} 回 (うち最後の文節 {lastOn} 回) / 直した後 {moreKanjiFixed} 回");
+        foreach (var example in examples) Console.WriteLine(example);
+        Console.WriteLine($"読み全体 (ライブ変換で Enter したときの変換エンジンの結果) の正解: なし {offOk}/{sentences}  あり {onOk}/{sentences}  直した後 {fixedOk}/{sentences}");
+        return 0;
+    }
+
+    private sealed class NoConverter : IKanjiConverter
+    {
+        public string? Convert(string hiragana) => null;
+        public IReadOnlyList<ConversionClause>? ConvertClauses(string hiragana, string? context = null) => null;
+    }
+}
+
 /// <summary>--zenzai-check: 本物のヘルパーを、アプリと同じ待ち時間で動かして確かめる (調べる用。通常のテストには入れない)。</summary>
 internal static class ZenzaiCheck
 {

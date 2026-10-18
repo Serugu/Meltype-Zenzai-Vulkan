@@ -21,6 +21,7 @@ Mozc が出した文節ごとの候補から、zenz が文全体と前の文の�
 - Space で変換したときは、設定「Zenzai を待つ時間」(既定 80ms) まで待つ。変換中・候補を選んでいる間は表示を差し替えない
 - 文脈あり・なしの両方で変換して区切りを比べるところ (`ConvertWithContext`) は、先に Mozc の区切りだけを比べて、zenz には 1 回だけ頼む
 - ヘルパーは前の頼みのプロンプトの KV キャッシュを残し、読みが伸びただけのプロンプトでは差分だけ計算する
+- ライブ変換の間は、Mozc の 1 番目がかなだけの文節を zenz に変えさせない (`HybridConverter.LiveKeepsKana`)。打っている途中は語が切れていて、Mozc はかなのまま出すのに、zenz は漢字の候補を選びがちだった (きょうははや → 今日は早、かんすうのひきすうをつい → 関数の引数を対)。`--zenzai-live` で測ると、打っている途中 1029 回のうち 20 回 (どれも打っている最後の文節) → 0 回。代わりに、読みを打ち終えてそのまま Enter したとき 1 文 (機会があればいきたい) は Zenzai なしと同じ結果になる (Space で変換すれば zenz が選ぶ)
 
 選び方 (`src/Meltype.Zenz/Scorer.cs`):
 
@@ -85,6 +86,8 @@ $env:MELTYPE_ZENZ = "$PWD\dist\zenzai\zenz\Meltype.Zenz.exe"   # 空にすると
 Get-Content tools\zenzai-cases.txt | dotnet run -c Release --project src/Meltype.Core.Tests -- --jht-batch
 # 起動・速さ・落ちたときの戻り・ライブ変換の差し替え
 dotnet run -c Release --project src/Meltype.Core.Tests -- --zenzai-check $env:MELTYPE_ZENZ
+# ライブ変換で、打っている途中にかなの文節が漢字になる回数 (Zenzai なし・あり・かなの文節を変えさせないとき)
+dotnet run -c Release --project src/Meltype.Core.Tests -- --zenzai-live $env:MELTYPE_ZENZ tools\zenzai-cases.txt tools\zenzai-holdout.txt
 ```
 
 ## 入れ方

@@ -23,6 +23,12 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     /// <summary>ライブ変換の間は true (Zenzai を短く待ち、間に合わなければ <see cref="Updated"/> で知らせる)。</summary>
     public bool Live { get; set; }
 
+    /// <summary>
+    /// ライブ変換の間は、Mozc の 1 番目がかなだけの文節を zenz に変えさせない (打ちかけの語を漢字にしない)。
+    /// Space で変換したときは zenz が選ぶ。測るときに切り替えられるようにしてある。
+    /// </summary>
+    public bool LiveKeepsKana { get; set; } = true;
+
     public event Action? Updated
     {
         add { if (zenzai is not null) zenzai.ResultReady += value; }
@@ -48,7 +54,10 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     {
         if (mozc!.Segments(hiragana, context) is not { Count: > 0 } segments) return null;
         var candidates = segments.Select(s => s.Candidates.Count > 0 ? s.Candidates : [s.Reading])
-            .Select((list, i) => Learned(segments[i].Reading, Plausible(segments[i].Reading, list))).ToList();
+            .Select((list, i) => Learned(segments[i].Reading, Plausible(segments[i].Reading, list)))
+            // 打っている途中は語が切れていることが多く、Mozc はそういう文節をかなのまま出すが、zenz は漢字の候補を選びがち
+            // (打っているそばから漢字になる)。ライブ変換の間は、かなのままの文節はかなのままにする
+            .Select(list => Live && LiveKeepsKana && IsKanaOnly(list[0]) ? [list[0]] : list).ToList();
         if (zenzai!.Choose(context, hiragana, candidates, Live) is not { } picks || picks.Length != segments.Count) return null;
         var clauses = new List<ConversionClause>(segments.Count);
         for (var i = 0; i < segments.Count; i++)
@@ -64,6 +73,9 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     /// 覚えた語が選ばれやすくなり、ほかの文節もその語に合わせて選ばれる (選んだあとにも、変換ボックスが覚えた語を最初の候補にする)。
     /// </summary>
     private IReadOnlyList<string> Learned(string reading, IReadOnlyList<string> candidates) => PreferLearned(learned?.Invoke(reading), candidates);
+
+    internal static bool IsKanaOnly(string text) =>
+        text.Length > 0 && text.All(c => c is >= 'ぁ' and <= 'ゖ' or >= 'ァ' and <= 'ヺ' or 'ー' or 'ゝ' or 'ゞ' or 'ヽ' or 'ヾ');
 
     /// <summary>覚えた語が候補にあれば 1 番目にする (無ければそのまま)。</summary>
     internal static IReadOnlyList<string> PreferLearned(string? text, IReadOnlyList<string> candidates) =>

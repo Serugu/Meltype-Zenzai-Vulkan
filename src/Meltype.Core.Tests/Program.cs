@@ -73,6 +73,9 @@ internal static class Program
                 // --zenzai-check <Meltype.Zenz.exe> [vulkan|cpu]: アプリと同じ待ち時間 (80ms) で Zenzai を動かし、
                 // 起動・選び直しの速さ・ヘルパーが落ちたときに Mozc に戻ってから起動し直すことを確かめる
                 return ZenzaiCheck.Run(args[1], args.ElementAtOrDefault(2) ?? "vulkan");
+            case "--zenzai-live":
+                // --zenzai-live <Meltype.Zenz.exe> <「出てほしい文 / 読み」のファイル>…: ライブ変換で打っている途中に漢字が増える回数 (MELTYPE_MOZC が要る)
+                return ZenzaiLiveCheck.Run(args[1], args.Skip(2));
             case "--explain":
                 if (Environment.GetEnvironmentVariable("MELTYPE_UTF8") == "1") Console.OutputEncoding = new System.Text.UTF8Encoding(false);
                 TestHost.Explain(args.Skip(1));
