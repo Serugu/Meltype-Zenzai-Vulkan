@@ -35,6 +35,25 @@ internal static class ZenzaiTests
     }
 
     [Test]
+    public static void AlignFree_ChecksTheReadingAndSplitsAtMozcBoundaries()
+    {
+        // 逆変換の代わり (漢字の並び → 読み)
+        static string? Reading(string text) => text switch { "庭" => "にわ", "二羽鶏" => "にわにわとり", "端" => "はし", "橋" => "はし", _ => null };
+        // Mozc の区切り にわには|にわにわとりが|いる に合わせて分ける
+        var clauses = HybridConverter.AlignFree("庭には二羽鶏がいる", "にわにはにわにわとりがいる", ["にわには", "にわにわとりが", "いる"], Reading);
+        Assert.Equal("にわには=庭には|にわにわとりが=二羽鶏が|いる=いる", string.Join("|", clauses!.Select(c => $"{c.Reading}={c.Text}")));
+        // 漢字の読みが Mozc の区切りをまたぐときは、1 つの文節にする (にわ|にわとり の区切りの真ん中に 二羽鶏)
+        clauses = HybridConverter.AlignFree("二羽鶏がいる", "にわにわとりがいる", ["にわ", "にわとりが", "いる"], Reading);
+        Assert.Equal("にわにわとりが=二羽鶏が|いる=いる", string.Join("|", clauses!.Select(c => $"{c.Reading}={c.Text}")));
+        // 読みが合わない (zenz が読みと違う字を書いた)・逆変換できないときは使わない
+        Assert.True(HybridConverter.AlignFree("庭には鶏がいる", "にわにはにわにわとりがいる", ["にわには", "にわにわとりが", "いる"], Reading) is null, "読みが合わない");
+        Assert.True(HybridConverter.AlignFree("箸がある", "はしがある", ["はしが", "ある"], Reading) is null, "逆変換できない");
+        // カタカナはひらがなにして照らす
+        clauses = HybridConverter.AlignFree("橋のプログラム", "はしのぷろぐらむ", ["はしの", "ぷろぐらむ"], Reading);
+        Assert.Equal("はしの=橋の|ぷろぐらむ=プログラム", string.Join("|", clauses!.Select(c => $"{c.Reading}={c.Text}")));
+    }
+
+    [Test]
     public static void Reranker_WithoutHelper_FallsBackToMozc()
     {
         var reranker = new ZenzaiReranker(Path.Combine(Path.GetTempPath(), "no-such-dir", "Meltype.Zenz.exe"),

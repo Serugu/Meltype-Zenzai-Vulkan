@@ -11,15 +11,17 @@ namespace Meltype.Zenz;
 /// <summary>
 /// zenz で、文節ごとの候補の組み合わせを点数付けして選ぶ (azooKey の Zenzai の「候補の評価」を簡単にしたもの)。
 ///
-/// プロンプト「 左の文脈  読み (カタカナ) 」を 1 回だけ計算し、その KV キャッシュを系列ごとに使い回す。
+/// プロンプト「\uEE02 左の文脈 \uEE00 読み (カタカナ) \uEE01」を 1 回だけ計算し、その KV キャッシュを系列ごとに使い回す。
 /// 文節ごとにビームサーチし、仮説の点数は「出力のトークンの対数確率の合計 − Mozc の順位 × rankWeight」。
 /// 最後に文の終わり (&lt;/s&gt;) の確率も足す。1 つの文節の仮説は、まとめて 1 回のバッチで計算する。
 /// </summary>
 internal sealed class Scorer : IDisposable
 {
-    private const string InputTag = "";
-    private const string OutputTag = "";
-    private const string ContextTag = "";
+    private const string InputTag = "\uEE00";
+    private const string OutputTag = "\uEE01";
+    private const string ContextTag = "\uEE02";
+    // zenz-v3.2 \u306E\u53F3\u306E\u6587\u8108 (\u30AD\u30E3\u30EC\u30C3\u30C8\u306E\u5F8C\u308D\u306E\u6587)\u3002\u5DE6\u306E\u6587\u8108\u306E\u5F8C\u308D\u3001\u5165\u529B\u306E\u524D\u306B\u7F6E\u304F (azooKey \u306E ZenzPromptBuilder \u3068\u540C\u3058)
+    private const string RightContextTag = "\uEE07";
     private const int MaxContextLength = 40;
     private const int MaxReadingLength = 120;
     private const int MaxPieceTokens = 24;
@@ -46,8 +48,21 @@ internal sealed class Scorer : IDisposable
         _rankWeight = options.RankWeight;
         _kanaPenalty = options.KanaPenalty;
         _promptSequence = (LLamaSeqId)(options.Beam + options.Beam * options.MaxCandidates);
-        _eos = weights.Vocab.EOS ?? throw new InvalidOperationException("モデルに文の終わりのトークンがありません");
+        _eos = EndToken(weights.Vocab);
         Backend = backend;
+    }
+
+    /// <summary>
+    /// 文の終わりのトークン。zenz の gguf は EOS に「&lt;s&gt;」(2) を入れているが、zenz が出力の終わりに出すのは「&lt;/s&gt;」(3)
+    /// (llama.cpp も読み込むときに「special_eos_id is not in special_eog_ids」と警告する)。「&lt;/s&gt;」があればそれを使う。
+    /// </summary>
+    private static LLamaToken EndToken(SafeLlamaModelHandle.Vocabulary vocab)
+    {
+        for (var i = 0; i < Math.Min(16, vocab.Count); i++)
+        {
+            if (vocab.LLamaTokenToString((LLamaToken)i, true) == "</s>") return (LLamaToken)i;
+        }
+        return vocab.EOS ?? throw new InvalidOperationException("モデルに文の終わりのトークンがありません");
     }
 
     public static Scorer Load(Options options)
@@ -97,17 +112,14 @@ internal sealed class Scorer : IDisposable
     private sealed record Hypothesis(int Sequence, float Score, int[] Picks, int Position, float[] Next);
 
     /// <summary>文節ごとに選んだ候補の番号。選べなければ null (呼び出し側は Mozc の 1 番目を使う)。</summary>
-    public int[]? Choose(string leftContext, string reading, IReadOnlyList<IReadOnlyList<string>> segments)
+    public int[]? Choose(string leftContext, string reading, IReadOnlyList<IReadOnlyList<string>> segments, string rightContext = "")
     {
         if (segments.Count == 0 || segments.Any(s => s.Count == 0) || reading.Length > MaxReadingLength) return null;
         if (segments.All(s => s.Count == 1)) return new int[segments.Count];
 
         var handle = _context.NativeHandle;
 
-        // プロンプト (zenz-v3 の形。左の文脈は末尾の 40 文字まで)
-        var trimmed = leftContext.Length > MaxContextLength ? leftContext[^MaxContextLength..] : leftContext;
-        var prompt = (trimmed.Length > 0 ? ContextTag + Preprocess(trimmed) : "") + InputTag + ToKatakana(Preprocess(reading)) + OutputTag;
-        var promptTokens = _context.Tokenize(prompt, true, false);
+        var promptTokens = PromptTokens(leftContext, reading, rightContext);
         if (EvaluatePrompt(promptTokens) is not { } promptNext) return null;
 
         // ビームの系列 0 はプロンプトの系列をコピーして始める (KV のセルは共有され、コピーはしない)
@@ -124,6 +136,71 @@ internal sealed class Scorer : IDisposable
             for (var s = 0; s < scratchBase + _beam * _maxCandidates; s++) handle.MemorySequenceRemove((LLamaSeqId)s, -1, -1);
         }
     }
+
+    /// <summary>プロンプト (zenz-v3 の形。左右の文脈はそれぞれ 40 文字まで) のトークン。</summary>
+    private LLamaToken[] PromptTokens(string leftContext, string reading, string rightContext)
+    {
+        var left = leftContext.Length > MaxContextLength ? leftContext[^MaxContextLength..] : leftContext;
+        var right = rightContext.Length > MaxContextLength ? rightContext[..MaxContextLength] : rightContext;
+        var prompt = (left.Length > 0 ? ContextTag + Preprocess(left) : "")
+            + (right.Length > 0 ? RightContextTag + Preprocess(right) : "")
+            + InputTag + ToKatakana(Preprocess(reading)) + OutputTag;
+        return _context.Tokenize(prompt, true, false);
+    }
+
+    /// <summary>
+    /// 候補に縛られずに zenz に変換させる (毎回いちばん確かなトークンを選ぶ)。あわせて、選び直しの答え (baseline) の点数も付ける。
+    /// 点数はどちらも出力のトークンと文の終わりの対数確率の合計 (Mozc の順位などの補正は入れない) なので、そのまま比べられる。
+    /// 文の終わりまで出せなければ null。zenz の出力は読みと合わないことがあるので、呼び出し側で確かめてから使う。
+    /// </summary>
+    public (string Text, float Score, float BaselineScore)? Generate(string leftContext, string reading, string rightContext, string baseline)
+    {
+        if (reading.Length == 0 || reading.Length > MaxReadingLength || baseline.Length == 0) return null;
+        var handle = _context.NativeHandle;
+        var promptTokens = PromptTokens(leftContext, reading, rightContext);
+        if (EvaluatePrompt(promptTokens) is not { } promptNext) return null;
+        try
+        {
+            // 選び直しの答えの点数 (系列 0)
+            var baselineTokens = _context.Tokenize(Preprocess(baseline), false, false);
+            if (baselineTokens.Length == 0 || baselineTokens.Length > (int)handle.BatchSize) return null;
+            handle.MemorySequenceCopy(_promptSequence, (LLamaSeqId)0, -1, -1);
+            _batch.Clear();
+            for (var i = 0; i < baselineTokens.Length; i++) _batch.Add(baselineTokens[i], promptTokens.Length + i, (LLamaSeqId)0, true);
+            if (handle.Decode(_batch) != DecodeResult.Ok) return null;
+            var baselineScore = promptNext[(int)baselineTokens[0]];
+            for (var i = 1; i < baselineTokens.Length; i++) baselineScore += LogProbability(handle.GetLogitsIth(i - 1), baselineTokens[i]);
+            baselineScore += LogProbability(handle.GetLogitsIth(baselineTokens.Length - 1), _eos);
+
+            // 自由に変換する (系列 1)。読みの長さの 2 倍 + 4 トークンまでに文の終わりが出なければ諦める
+            handle.MemorySequenceCopy(_promptSequence, (LLamaSeqId)1, -1, -1);
+            var generated = new List<LLamaToken>();
+            var next = promptNext;
+            var score = 0f;
+            for (var step = 0; step < reading.Length * 2 + 4; step++)
+            {
+                var best = 0;
+                for (var t = 1; t < next.Length; t++) if (next[t] > next[best]) best = t;
+                score += next[best];
+                if (best == (int)_eos) return (Postprocess(_context.DeTokenize(generated)), score, baselineScore);
+                var token = (LLamaToken)best;
+                generated.Add(token);
+                _batch.Clear();
+                _batch.Add(token, promptTokens.Length + step, (LLamaSeqId)1, true);
+                if (handle.Decode(_batch) != DecodeResult.Ok) return null;
+                next = LogSoftmax(handle.GetLogitsIth(0));
+            }
+            return null;
+        }
+        finally
+        {
+            handle.MemorySequenceRemove((LLamaSeqId)0, -1, -1);
+            handle.MemorySequenceRemove((LLamaSeqId)1, -1, -1);
+        }
+    }
+
+    // Preprocess で全角空白にした空白を戻す
+    private static string Postprocess(string text) => text.Replace('\u3000', ' ');
 
     // 前の頼みのプロンプトのトークンと、その最後の位置の対数確率 (次のトークンの予測)
     private LLamaToken[] _cachedPrompt = [];
@@ -243,7 +320,7 @@ internal sealed class Scorer : IDisposable
     }
 
     // zenz のトークナイザーに合わせる (azooKey と同じ: 空白は全角空白、改行は使わない)
-    private static string Preprocess(string text) => text.Replace(' ', '　').Replace('\n', '　').Replace('\r', '　');
+    private static string Preprocess(string text) => text.Replace(' ', '\u3000').Replace('\n', '\u3000').Replace('\r', '\u3000');
 
     private static string ToKatakana(string text)
     {

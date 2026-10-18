@@ -106,6 +106,7 @@ internal static class TestRunner
         }
         if (args.FirstOrDefault() == "--winmd") { WinMdProbe.Run(args[1], args.Skip(2)); return 0; }
         if (args.FirstOrDefault() == "--candidates") { using var winrt = new Composition.WinRtCandidates(); foreach (var r in args.Skip(1)) Console.WriteLine($"{r}: {string.Join(", ", winrt.Get(r))}"); foreach (var e in Diagnostics.Log.Snapshot()) Console.WriteLine(e); return 0; }
+        if (args.FirstOrDefault() == "--zenzai-free") return ZenzaiFreeCheck.Run(args[1], args.Skip(2).ToList());
         if (args.FirstOrDefault() == "--mozc")
         {
             // dotnet run --project src/Meltype.Tests -- --mozc <meltype_mozc_helper.exe> はははきょうしょくじにいきました ...

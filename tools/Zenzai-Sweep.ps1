@@ -4,7 +4,7 @@
 # zenz のヘルパーの --bench を、設定 (ヘルパーに渡す引数) と評価データ (tools/zenzai-eval.py で作ったもの) を変えて走らせ、
 # 正解数を表にする。括弧の中は Mozc だけのときの正解数。
 #
-#   powershell -ExecutionPolicy Bypass -File .\tools\Zenzai-Sweep.ps1 -Data dist\zenzai-eval -Configs '', '--beam 4', '--rank-weight 1'
+#   .\tools\Zenzai-Sweep.ps1 -Configs '', '--beam 4', '--rank-weight 1'   (PowerShell の中で実行する。-File で渡すと一覧が 1 つの文字列になる)
 param(
     [string]$Data = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\zenzai-eval'),
     [string[]]$Configs = @(''),

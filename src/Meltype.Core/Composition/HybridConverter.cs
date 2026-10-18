@@ -13,9 +13,25 @@ namespace Meltype.Composition;
 /// </summary>
 public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter? mozc, IKanjiConverter system,
     Func<string, IReadOnlyList<string>>? systemCandidates, ZenzaiReranker? zenzai = null, Func<bool>? useZenzai = null,
-    Func<string, string?>? learned = null)
-    : IKanjiConverter, ILearningConverter, ILiveConversionAware
+    Func<string, string?>? learned = null, Func<string, string?>? readingOf = null)
+    : IKanjiConverter, ILearningConverter, ILiveConversionAware, ISurroundingsAware
 {
+    /// <summary>
+    /// zenz に候補に縛られず変換させた結果 (読みを逆変換で確かめたもの) を使うのは、その点数が選び直しの答えより
+    /// これだけ高いとき (zenz の対数確率)。AJIMEE-Bench と tools/zenzai-*.txt で決めた (差 0〜1 が同じくらいで、2 以上は使う回数が減って正解も減る)。
+    /// 測るときに変えられる (float.MaxValue で使わない)。readingOf (漢字の読みを求める逆変換) を渡さなければ、自由な変換は使わない。
+    /// </summary>
+    public float FreeMargin { get; set; } = 1f;
+
+    // zenz に渡す前後の文 (変換ボックスが変換を頼む前に入れる。Mozc に渡す文脈より長い)
+    private string? _before, _after;
+
+    public void SetSurroundings(string? before, string? after)
+    {
+        _before = before;
+        _after = after;
+    }
+
     private bool UseMozc => engine() != ConversionEngine.System && mozc is { IsAvailable: true };
     private bool UseSystem => engine() != ConversionEngine.Mozc || mozc is not { IsAvailable: true };
     private bool UseZenzai => UseMozc && zenzai is not null && (useZenzai?.Invoke() ?? false);
@@ -58,15 +74,96 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
             // 打っている途中は語が切れていることが多く、Mozc はそういう文節をかなのまま出すが、zenz は漢字の候補を選びがち
             // (打っているそばから漢字になる)。ライブ変換の間は、かなのままの文節はかなのままにする
             .Select(list => Live && LiveKeepsKana && IsKanaOnly(list[0]) ? [list[0]] : list).ToList();
-        if (zenzai!.Choose(context, hiragana, candidates, Live) is not { } picks || picks.Length != segments.Count) return null;
+        // zenz の左の文脈は、変換ボックスが渡した長い文 (無ければ Mozc と同じ文脈)。仮の文脈 (に → これ + に) は Mozc 向けなので使わない
+        var left = _before ?? (context == "これ" ? null : context);
+        if (zenzai!.Choose(left, hiragana, candidates, Live, _after) is not { } picks || picks.Length != segments.Count) return null;
         var clauses = new List<ConversionClause>(segments.Count);
         for (var i = 0; i < segments.Count; i++)
         {
             if (picks[i] >= candidates[i].Count) return null;
             clauses.Add(new ConversionClause(segments[i].Reading, candidates[i][picks[i]]));
         }
+        return Live ? clauses : WithFreeConversion(left, hiragana, clauses) ?? clauses;
+    }
+
+    /// <summary>
+    /// Space で変換したとき: zenz に候補に縛られず変換させ、Mozc の候補に無い答え (区切りの違い: 庭鶏 → 二羽鶏) を拾う。
+    /// 漢字の部分の読みを逆変換 (Microsoft IME) で確かめ、読みが合い、zenz の点数が選び直しの答えより FreeMargin 以上高ければ使う。
+    /// 使わないときは null。
+    /// </summary>
+    private List<ConversionClause>? WithFreeConversion(string? left, string hiragana, List<ConversionClause> chosen)
+    {
+        if (readingOf is null || FreeMargin >= float.MaxValue) return null;
+        var baseline = string.Concat(chosen.Select(c => c.Text));
+        if (zenzai!.Generate(left, hiragana, _after, baseline) is not { } free || free.Text == baseline || free.Score < free.BaselineScore + FreeMargin) return null;
+        return AlignFree(free.Text, hiragana, chosen.Select(c => c.Reading).ToList(), readingOf);
+    }
+
+    /// <summary>
+    /// zenz が自由に変換した文字列 (text) の読みが、入力の読みと合うかを確かめ、文節に分け直す。合わなければ null。
+    /// 漢字の並びの読みは逆変換 (readingOf) で求め、それ以外の文字はそのまま (カタカナはひらがなにして) 読みと照らす。
+    /// 文節の区切りは Mozc の区切り (segmentReadings) に合わせ、漢字の並びの読みが区切りをまたぐところは 1 つの文節にする。
+    /// </summary>
+    internal static List<ConversionClause>? AlignFree(string text, string reading, IReadOnlyList<string> segmentReadings, Func<string, string?> readingOf)
+    {
+        // 文字列を「漢字の並び」と「それ以外の 1 文字」に分け、それぞれの読みを求める
+        var pieces = new List<(string Text, string Reading, bool Ideograph)>();
+        for (var i = 0; i < text.Length;)
+        {
+            if (IsIdeograph(text[i]))
+            {
+                var end = i;
+                while (end < text.Length && IsIdeograph(text[end])) end++;
+                var run = text[i..end];
+                if (readingOf(run) is not { Length: > 0 } runReading) return null;
+                pieces.Add((run, ToHiragana(runReading).Replace(" ", "").Replace("\u3000", ""), true));
+                i = end;
+            }
+            else
+            {
+                pieces.Add((text[i].ToString(), ToHiragana(text[i].ToString()), false));
+                i++;
+            }
+        }
+        var expected = ToHiragana(reading);
+        if (string.Concat(pieces.Select(p => p.Reading)) != expected) return null;
+
+        // Mozc の区切りの位置 (読みの何文字目か)。漢字の並びの読みの途中にある区切りは使わない
+        var boundaries = new SortedSet<int>();
+        var offset = 0;
+        foreach (var segment in segmentReadings)
+        {
+            offset += segment.Length;
+            boundaries.Add(offset);
+        }
+        if (offset != expected.Length) return null;
+        var position = 0;
+        foreach (var piece in pieces)
+        {
+            if (piece.Ideograph || piece.Reading.Length != piece.Text.Length) boundaries.RemoveWhere(b => b > position && b < position + piece.Reading.Length);
+            position += piece.Reading.Length;
+        }
+
+        var clauses = new List<ConversionClause>();
+        var clauseText = new System.Text.StringBuilder();
+        var clauseStart = 0;
+        position = 0;
+        foreach (var piece in pieces)
+        {
+            clauseText.Append(piece.Text);
+            position += piece.Reading.Length;
+            if (!boundaries.Contains(position)) continue;
+            clauses.Add(new ConversionClause(reading[clauseStart..position], clauseText.ToString()));
+            clauseText.Clear();
+            clauseStart = position;
+        }
         return clauses;
     }
+
+    private static bool IsIdeograph(char c) => c is >= '\u4E00' and <= '\u9FFF' or >= '\u3400' and <= '\u4DBF' or '々' or '〆' or 'ヶ' or 'ヵ' or '〇';
+
+    private static string ToHiragana(string text) =>
+        new(text.Select(c => c is >= 'ァ' and <= 'ヶ' ? (char)(c - 0x60) : c).ToArray());
 
     /// <summary>
     /// ユーザーが前に選び直した語 (conversions.json) を 1 番目の候補にして zenz に渡す。zenz は Mozc の順位も点数に入れるので、

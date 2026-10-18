@@ -112,7 +112,7 @@ internal sealed class CompositionService : ICompositionHost, IDisposable
         var zenzaiOptions = options.ZenzaiOptions ?? (() => new ZenzaiOptions(ZenzaiOptions.DefaultModelPath, "vulkan", 10, 80));
         _zenzai = new ZenzaiReranker(Path.Combine(AppContext.BaseDirectory, "zenz", "Meltype.Zenz.exe"), zenzaiOptions);
         _hybrid = new HybridConverter(options.Engine, _mozc, _converter, reading => _windowsCandidates.Get(reading), _zenzai, options.Zenzai,
-            reading => History.Get(reading));
+            reading => History.Get(reading), text => _converter.Reading(text));
         _resolved = resolved;
         Controller = new CompositionController(Gate, detector, _hybrid, this, resolved);
         Controller.Corrected += Corrections.Add;

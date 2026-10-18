@@ -18,8 +18,10 @@ namespace Meltype.Zenz;
 /// 準備ができたら「READY 実際のバックエンド」、できなければ「ERROR 理由」を 1 行書く。
 ///
 /// やり取り (UTF-8):
-///   E[TAB]左の文脈[TAB]読み (ひらがなでもカタカナでもよい)[TAB]文節1の候補1[US]候補2…[RS]文節2の候補…
+///   E[TAB]左の文脈[TAB]読み (ひらがなでもカタカナでもよい)[TAB]文節1の候補1[US]候補2…[RS]文節2の候補…[TAB]右の文脈 (無ければ省く)
 ///     → 文節ごとに選んだ候補の番号を [US] でつないだ 1 行 (選べなければ空行)
+///   G[TAB]左の文脈[TAB]読み[TAB]右の文脈[TAB]選び直しの答え
+///     → 候補に縛られずに zenz が変換した文字列[TAB]その点数[TAB]選び直しの答えの点数 (出せなければ空行。読みと合うかは呼び出し側で確かめる)
 ///   P → OK (生きているかの確認)
 ///   Q → 終了
 /// 使わない時間が続いたら (--idle-exit)、自分で終了して VRAM・メモリを空ける。Meltype は次の変換で起動し直す。
@@ -84,7 +86,9 @@ internal static class Program
             string reply;
             try
             {
-                reply = line.StartsWith("E\t", StringComparison.Ordinal) ? Evaluate(scorer, line) : "";
+                reply = line.StartsWith("E\t", StringComparison.Ordinal) ? Evaluate(scorer, line)
+                    : line.StartsWith("G\t", StringComparison.Ordinal) ? Generate(scorer, line)
+                    : "";
             }
             catch (Exception ex)
             {
@@ -115,12 +119,22 @@ internal static class Program
         }
     }
 
+    /// <summary>G[TAB]左の文脈[TAB]読み[TAB]右の文脈[TAB]選び直しの答え → 自由な変換[TAB]その点数[TAB]選び直しの答えの点数 (出せなければ空行)。</summary>
+    private static string Generate(Scorer scorer, string line)
+    {
+        var fields = line.Split('\t');
+        if (fields.Length < 5) return "";
+        return scorer.Generate(fields[1], fields[2], fields[3], fields[4]) is { } result
+            ? string.Join('\t', result.Text, result.Score.ToString("R", CultureInfo.InvariantCulture), result.BaselineScore.ToString("R", CultureInfo.InvariantCulture))
+            : "";
+    }
+
     private static string Evaluate(Scorer scorer, string line)
     {
         var fields = line.Split('\t');
         if (fields.Length < 4) return "";
         var segments = fields[3].Split(RecordSeparator).Select(r => (IReadOnlyList<string>)r.Split(UnitSeparator)).ToList();
-        var picks = scorer.Choose(fields[1], fields[2], segments);
+        var picks = scorer.Choose(fields[1], fields[2], segments, fields.Length > 4 ? fields[4] : "");
         return picks is null ? "" : string.Join(UnitSeparator, picks);
     }
 
@@ -137,9 +151,9 @@ internal static class Program
         int zenzCorrect = 0, mozcCorrect = 0, graded = 0;
         foreach (var l in lines)
         {
-            // 4 列目があれば正解 (| で区切って複数書ける)
+            // 4 列目があれば正解 (| で区切って複数書ける)、5 列目があれば右の文脈
             var fields = l.Split('\t');
-            var request = "E\t" + string.Join('\t', fields.Take(3));
+            var request = "E\t" + string.Join('\t', fields.Take(3)) + (fields.Length > 4 && fields[4].Length > 0 ? "\t" + fields[4] : "");
             var started = Stopwatch.GetTimestamp();
             var picks = Evaluate(scorer, request);
             times.Add(Stopwatch.GetElapsedTime(started).TotalMilliseconds);

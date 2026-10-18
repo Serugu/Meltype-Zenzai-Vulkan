@@ -1,7 +1,8 @@
 # Zenzai (ニューラル変換) — zenzai ブランチ
 
-Windows 版の Meltype に、azooKey の「Zenzai」で使われているかな漢字変換モデル **zenz** を足したものです。
-Mozc が出した文節ごとの候補から、zenz が文全体と前の文の流れに合う組み合わせを選び直します。
+Windows 版の Meltype (上流の v1.2.2-pre.2 を取り込み済み) に、azooKey の「Zenzai」で使われているかな漢字変換モデル **zenz** を足したものです。
+Mozc が出した文節ごとの候補から、zenz が文全体と前後の文の流れに合う組み合わせを選び直します。
+Space で変換したときは、zenz に候補に縛られず変換もさせ、読みを Microsoft IME の逆変換で確かめられたら使います (Mozc の候補に無い答えを拾う)。
 
 ```
 感じ変換の制度を上げる   →  漢字変換の精度を上げる
@@ -25,13 +26,21 @@ Mozc が出した文節ごとの候補から、zenz が文全体と前の文の�
 
 選び方 (`src/Meltype.Zenz/Scorer.cs`):
 
-- プロンプトは zenz-v3 の形 ` 左の文脈  読み (カタカナ) `。左の文脈は末尾の 40 文字まで
+- プロンプトは zenz-v3.2 の形 `\uEE02 左の文脈 \uEE07 右の文脈 \uEE00 読み (カタカナ) \uEE01`。左右の文脈は同じ文の中の 40 文字まで (`CompositionController.ShareSurroundings`)。Mozc には今までどおり左の文脈を 10 文字だけ渡す (長くすると Mozc は区切りが引きずられる)。AJIMEE で、左の文脈を 10 → 40 文字にすると 75 → 77 問 (確かめ用)。右の文脈は増減なし (文の途中を打ち直すときのため)
+- 文の終わりのトークンは `</s>` (3)。zenz の gguf の EOS は `<s>` (2) になっていて、そのまま使うと文の終わりの確率を間違えていた (直すと AJIMEE 確かめ用 77 → 79 問)
 - 文節ごとにビームサーチ (幅 2、1 文節の候補は Mozc の上位 8 個まで)。点数は「出力のトークンの対数確率の合計 − Mozc の順位 × 0.75」で、最後に文の終わりの確率を足す
 - Mozc の 1 番目が漢字なのに、かなだけの候補を選ぶときは 1 を引く (zenz はかな書きを好みがちで、測るとかなに崩す誤りが多かった)
 - 値は AJIMEE-Bench の半分 (100 問) と `tools/zenzai-cases.txt` で決めた。ビーム幅 4 と 2 で正解数はほぼ同じで、2 のほうが 2〜3 割速い
 - 送り仮名を落とした候補 (はこぶ → 運) は zenz に渡さない (`HybridConverter.Plausible`)
 - ユーザーが前に選び直した語 (conversions.json) は、1 番目の候補にして zenz に渡す (`HybridConverter.PreferLearned`)。ほかの文節もその語に合わせて選ばれる
 - プロンプトの KV キャッシュはすべての仮説で共有し、1 つの文節の仮説はまとめて 1 回のバッチで計算する
+
+自由な変換 (Space で変換したときだけ。`HybridConverter.WithFreeConversion`):
+
+- 選び直しのあとに、zenz に候補に縛られず変換させる (毎回いちばん確かなトークン。1 回 10〜35ms)。あわせて選び直しの答えの点数も付ける
+- 漢字の並びの読みを Microsoft IME の逆変換で求め、かな・記号はそのまま照らし、入力の読みと全部合うときだけ使う (`HybridConverter.AlignFree`)。文節は Mozc の区切りに合わせて分け直し、漢字の読みが区切りをまたぐところは 1 つの文節にする
+- 使うのは、自由な変換の点数が選び直しの答えより 1 以上高いとき (`FreeMargin`)
+- AJIMEE 確かめ用で 78 → 82 問 (5 回使って、多変数複素環数論 → 関数論、地球参加 → 讃歌 など)。使われるのは 100 問に数回で、zenz-v3.2-small 自身が区切りを間違える文 (庭には二羽鶏がいる) は直らない
 
 zenz の pre-tokenizer「gpt2-small-japanese-char」は本家の llama.cpp が知らない名前なので、読み込むときに `tokenizer.ggml.pre` を `gpt-2` に差し替えています (azooKey 版の llama.cpp も同じ扱い)。
 
@@ -61,10 +70,12 @@ CUDA 版の LLamaSharp は `ggml-cuda.dll` だけで約 540MB あり、さらに
 [AJIMEE-Bench](https://github.com/azooKey/AJIMEE-Bench) (azooKey の変換の評価データ。日本語 Wikipedia 入力誤りデータセットから作った 200 問、半分は左の文脈つき、CC-BY-SA 3.0) で、
 Mozc の文節の候補から zenz が選んだ結果 (許される答えのどれかと同じか):
 
-| | Mozc だけ | Mozc + Zenzai |
-| --- | --- | --- |
-| AJIMEE 重みを決める用 (100 問) | 53 | 76 |
-| AJIMEE 確かめる用 (100 問) | 50 | 75 |
+| | Mozc だけ | Mozc + Zenzai (選び直し) | + 自由な変換 (Space) |
+| --- | --- | --- | --- |
+| AJIMEE 重みを決める用 (100 問) | 53 | 79 | 81 |
+| AJIMEE 確かめる用 (100 問) | 50 | 79 | 82 |
+
+(左の文脈は zenz に 40 文字、Mozc に 10 文字。選び直しの列は zenz のヘルパーの `--bench`、自由な変換の列は Microsoft IME の逆変換を使う `src/Meltype.Tests -- --zenzai-free` で測った。数え方の違いで 1 問ずれることがある)
 
 `tools/zenzai-cases.txt` (同音異義語の多い 80 文。重みを決めるのにも使った) と `tools/zenzai-holdout.txt` (使っていない 40 文) で、
 打ったキーから通しで確かめた結果 (Space の最初の変換が出てほしい文と同じか):
@@ -72,18 +83,22 @@ Mozc の文節の候補から zenz が選んだ結果 (許される答えのど�
 | | Mozc だけ | Mozc + Zenzai |
 | --- | --- | --- |
 | zenzai-cases (80 文) | 57 | 66 (悪くなった文は 0) |
-| zenzai-holdout (40 文) | 33 | 33 (1 文直り、1 文は「十分」が「10分」になった) |
+| zenzai-holdout (40 文) | 35 | 36 (2 文直り、1 文は「十分」が「10分」になった) |
+
+(打ったキーから通しの道具は Mac・Linux でも動くように Microsoft IME を使わないので、自由な変換は入っていない)
 
 ```powershell
 # 評価データ (AJIMEE-Bench はライセンスが違うので、取ってきて dist\ に置く。リポジトリには入れない)
 gh api -H "Accept: application/vnd.github.raw" repos/azooKey/AJIMEE-Bench/contents/JWTD_v2/v1/evaluation_items.json > dist\zenzai-eval\ajimee.json
 python tools\zenzai-eval.py native\mozc\bin\meltype_mozc_helper.exe dist\zenzai-eval dist\zenzai-eval\ajimee.json
-powershell -ExecutionPolicy Bypass -File .\tools\Zenzai-Sweep.ps1 -Configs '', '--beam 4', '--rank-weight 1'   # 重みを変えて正解数を比べる
+.\tools\Zenzai-Sweep.ps1 -Configs '', '--beam 4', '--rank-weight 1'   # 重みを変えて正解数を比べる (PowerShell の中で。-File で渡すと一覧が 1 つの文字列になる)
 
 # 打ったキーから通しで (Zenzai なし / あり)
 $env:MELTYPE_MOZC = "$PWD\native\mozc\bin\meltype_mozc_helper.exe"
 $env:MELTYPE_ZENZ = "$PWD\dist\zenzai\zenz\Meltype.Zenz.exe"   # 空にすると Mozc だけ
 Get-Content tools\zenzai-cases.txt | dotnet run -c Release --project src/Meltype.Core.Tests -- --jht-batch
+# Space で変換したときの自由な変換 (Microsoft IME の逆変換で確かめる) を使う・使わないで比べる (Windows)
+dotnet run -c Release --project src/Meltype.Tests -- --zenzai-free $env:MELTYPE_ZENZ dist\zenzai-eval\ajimee-test-ctx40.tsv
 # 起動・速さ・落ちたときの戻り・ライブ変換の差し替え
 dotnet run -c Release --project src/Meltype.Core.Tests -- --zenzai-check $env:MELTYPE_ZENZ
 # ライブ変換で、打っている途中にかなの文節が漢字になる回数 (Zenzai なし・あり・かなの文節を変えさせないとき)

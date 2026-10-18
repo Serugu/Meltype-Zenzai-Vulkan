@@ -1663,6 +1663,7 @@ public sealed class CompositionController
     /// </summary>
     private List<Clause> ConvertJapanese(string kana)
     {
+        ShareSurroundings();
         // ローマ字として読めずに残った英字 (こほぃc の c) と半角の記号 (... @) は、変換エンジンに渡すと別の記号 (© ．．． ＠) にされるので、
         // そのままの文節にする。数字は、記号・英字とつながっていればそのまま (3.0 の 3 を 1 文字だけ渡すと ❸ にされる)、
         // それ以外は変換エンジンに渡す (2026ねん → 2026年)。
@@ -1957,13 +1958,36 @@ public sealed class CompositionController
     }
 
     /// <summary>変換エンジンに渡す文脈: キャレットの前の確定済みの文字のうち、同じ文の日本語の部分 (最大 10 文字)。</summary>
-    private string? ConversionContext()
+    private string? ConversionContext() => SentenceBefore(10);
+
+    /// <summary>キャレットの前の確定済みの文字のうち、同じ文の日本語の部分 (最大 max 文字)。</summary>
+    private string? SentenceBefore(int max)
     {
         var text = _precedingText;
         if (string.IsNullOrEmpty(text) || LanguageOf(text) != false) return null;
         var start = text.LastIndexOfAny(SentenceEnds);
         text = text[(start + 1)..].Trim();
-        return text.Length == 0 ? null : text.Length > 10 ? text[^10..] : text;
+        return text.Length == 0 ? null : text.Length > max ? text[^max..] : text;
+    }
+
+    /// <summary>キャレットの後ろの文字のうち、同じ文の日本語の部分 (最大 max 文字)。文の途中を打ち直すときにある。</summary>
+    private string? SentenceAfter(int max)
+    {
+        var text = _followingText;
+        if (string.IsNullOrEmpty(text)) return null;
+        var end = text.IndexOfAny(SentenceEnds);
+        text = (end >= 0 ? text[..end] : text).Trim();
+        if (text.Length == 0 || LanguageOf(text) != false) return null;
+        return text.Length > max ? text[..max] : text;
+    }
+
+    /// <summary>
+    /// 長い前後の文を使える変換エンジン (Zenzai) に、同じ文の中のキャレットの前と後ろ (40 文字まで) を渡す。
+    /// Mozc に渡す文脈 (10 文字) は前に同じ語があると区切りが引きずられるので短いままにし、zenz にだけ長く渡す。
+    /// </summary>
+    private void ShareSurroundings()
+    {
+        if (_converter is ISurroundingsAware aware) aware.SetSurroundings(SentenceBefore(40), SentenceAfter(40));
     }
 
     private static readonly char[] SentenceEnds = ['。', '．', '！', '？', '\n', '\r'];
@@ -2397,6 +2421,7 @@ public sealed class CompositionController
     private string Convert(string kana)
     {
         if (_conversionCache.TryGetValue(kana, out var cached)) return cached;
+        ShareSurroundings();
         var converted = NormalizeHalfWidth(_converter.Convert(kana) ?? kana, kana);
         if (_conversionCache.Count > 256) _conversionCache.Clear();
         _conversionCache[kana] = converted;

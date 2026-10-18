@@ -74,10 +74,14 @@ if (-not (Test-Path -LiteralPath $model) -or (Get-FileHash -LiteralPath $model -
 }
 
 Stop-Meltype
-# 最初の 1 回だけ、公式の DLL を控える (何度入れ直しても公式の DLL に戻せるように)
-if (-not (Test-Path -LiteralPath $backup)) {
+# 入っている Meltype.dll が公式のもの (版に zenzai が付いていない) なら、控えを取り直す
+# (公式の新しい版を入れてから入れ直したときに、-Restore で古い版の DLL に戻さないように。前の控えはごみ箱へ)
+$installed = (Get-Item -LiteralPath (Join-Path $app 'Meltype.dll')).VersionInfo.ProductVersion
+if ($installed -notmatch 'zenzai') {
+    Send-ToRecycleBin $backup
     New-Item -ItemType Directory -Force -Path $backup | Out-Null
     foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $app $dll) -Destination $backup }
+    Write-Host "公式の DLL ($installed) を控えました: $backup"
 }
 foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $stage "app\$dll") -Destination $app -Force }
 # 前の版のヘルパーはごみ箱へ送ってから置く (前の版にだけあったファイルを残さない)

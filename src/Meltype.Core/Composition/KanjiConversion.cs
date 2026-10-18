@@ -40,6 +40,15 @@ public interface ILiveConversionAware
     IReadOnlyList<string>? SegmentReadings(string hiragana, string? context);
 }
 
+/// <summary>
+/// 変換の文脈 (ConvertClauses の context。最大 10 文字) より長い前後の文を使える変換エンジン (Zenzai)。
+/// 変換を頼む前に、同じ文の中のキャレットの前と後ろの文字を渡す (無ければ null)。
+/// </summary>
+public interface ISurroundingsAware
+{
+    void SetSurroundings(string? before, string? after);
+}
+
 /// <summary>確定した変換を覚えられる変換エンジン (Mozc)。次から同じ読みで同じ文字列を先に出す。</summary>
 public interface ILearningConverter
 {

@@ -30,7 +30,8 @@ public sealed record ZenzaiOptions(string ModelPath, string Backend, int IdleExi
 /// zenz (azooKey の Zenzai のかな漢字変換モデル) で、Mozc の文節ごとの候補から組み合わせを選び直す。
 /// 同梱のヘルパー (zenz\Meltype.Zenz.exe、llama.cpp で GPU 推論) を別のプロセスで動かし、標準入出力で頼む。
 ///
-/// やり取り (UTF-8、1 行ずつ): 「E[TAB]前の文字列[TAB]読み[TAB]文節1の候補1[US]候補2…[RS]文節2の候補…」を送ると、
+/// やり取り (UTF-8、1 行ずつ): 「E[TAB]前の文字列[TAB]読み[TAB]文節1の候補1[US]候補2…[RS]文節2の候補…[TAB]後ろの文字列」を送ると
+/// (後ろの文字列は無ければ省く)、
 /// 文節ごとに選んだ候補の番号を [US] でつないだ 1 行が返る (選べなければ空行)。
 /// ヘルパーの起動 (重みの読み込みと GPU の準備) はバックグラウンドで行い、そのあいだや、応答が遅い・失敗したときは null を返す
 /// (呼び出し側は Mozc の 1 番目の候補を使う)。ヘルパーは使わない時間が続くと自分で終了するので、次に頼まれたら起動し直す。
@@ -44,7 +45,8 @@ public sealed class ZenzaiReranker : IDisposable
     private readonly string _helperPath;
     private readonly Func<ZenzaiOptions> _options;
     private readonly object _gate = new();
-    private readonly Dictionary<string, int[]?> _results = new(StringComparer.Ordinal);
+    // 頼みの行 → 返事の行 (同じ読みはライブ変換で何度も頼まれるので控える)
+    private readonly Dictionary<string, string?> _results = new(StringComparer.Ordinal);
     private Process? _process;
     private ZenzaiOptions? _startedWith;
     private Task? _starting;
@@ -98,12 +100,39 @@ public sealed class ZenzaiReranker : IDisposable
     /// candidates は文節ごとの候補 (Mozc の順。どの文節にも 1 つ以上ある)。
     /// live はライブ変換 (打つたびの変換) のとき。待つ時間を短くし、間に合わなければ結果が届いたときに <see cref="ResultReady"/> で知らせる。
     /// </summary>
-    public int[]? Choose(string? context, string reading, IReadOnlyList<IReadOnlyList<string>> candidates, bool live = false)
+    public int[]? Choose(string? context, string reading, IReadOnlyList<IReadOnlyList<string>> candidates, bool live = false, string? after = null)
     {
         if (candidates.Count == 0 || candidates.Any(c => c.Count == 0)) return null;
         if (candidates.All(c => c.Count == 1)) return new int[candidates.Count];
         if (!IsAvailable) return null;
-        var request = $"E\t{Clean(context ?? "")}\t{Clean(reading)}\t{string.Join(RecordSeparator, candidates.Select(c => string.Join(UnitSeparator, c.Select(Clean))))}";
+        var request = $"E\t{Clean(context ?? "")}\t{Clean(reading)}\t{string.Join(RecordSeparator, candidates.Select(c => string.Join(UnitSeparator, c.Select(Clean))))}"
+            + (string.IsNullOrEmpty(after) ? "" : "\t" + Clean(after));
+        return Parse(Ask(request, live), candidates.Count);
+    }
+
+    /// <summary>
+    /// 候補に縛られずに zenz に変換させた文字列と、その点数・選び直しの答え (baseline) の点数 (どちらも zenz の対数確率の合計)。
+    /// zenz の出力は読みと合わないことがあるので、使う前に確かめる。準備中・間に合わない・出せないときは null。
+    /// </summary>
+    public (string Text, float Score, float BaselineScore)? Generate(string? context, string reading, string? after, string baseline)
+    {
+        if (!IsAvailable || reading.Length == 0 || baseline.Length == 0) return null;
+        var request = $"G\t{Clean(context ?? "")}\t{Clean(reading)}\t{Clean(after ?? "")}\t{Clean(baseline)}";
+        if (Ask(request, live: false) is not { Length: > 0 } line) return null;
+        var fields = line.Split('\t');
+        return fields.Length == 3
+            && float.TryParse(fields[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var score)
+            && float.TryParse(fields[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var baselineScore)
+            ? (fields[0], score, baselineScore)
+            : null;
+    }
+
+    /// <summary>
+    /// 1 行頼んで 1 行の返事を受け取る (同じ頼みは控えから返す)。準備中・間に合わない・失敗したときは null。
+    /// live はライブ変換のとき (待つ時間を短くし、間に合わなければ返事が届いたときに <see cref="ResultReady"/> で知らせる)。
+    /// </summary>
+    private string? Ask(string request, bool live)
+    {
         var options = _options();
         var budget = Math.Max(5, live ? options.LiveTimeoutMs : options.TimeoutMs);
         var started = Stopwatch.GetTimestamp();
@@ -145,7 +174,7 @@ public sealed class ZenzaiReranker : IDisposable
                     reply.ContinueWith(_ => OnLateReply(reply), TaskScheduler.Default);
                     return null;
                 }
-                return Remember(request, Parse(reply.Result, candidates.Count));
+                return Remember(request, reply.Result);
             }
             catch (Exception ex)
             {
@@ -212,8 +241,7 @@ public sealed class ZenzaiReranker : IDisposable
         try
         {
             if (!pending.Reply.Wait(waitMs)) return false;
-            var count = pending.Key.Split('\t')[3].Split(RecordSeparator).Length;
-            Remember(pending.Key, Parse(pending.Reply.Result, count));
+            Remember(pending.Key, pending.Reply.Result);
         }
         catch (Exception ex)
         {
@@ -241,11 +269,12 @@ public sealed class ZenzaiReranker : IDisposable
         return picks;
     }
 
-    private int[]? Remember(string key, int[]? picks)
+    /// <summary>返事 (の行) を控えに入れる (_gate の中で呼ぶ)。</summary>
+    private string? Remember(string key, string? reply)
     {
         if (_results.Count > 512) _results.Clear();
-        _results[key] = picks;
-        return picks;
+        _results[key] = reply;
+        return reply;
     }
 
     // タブ・改行・区切りの文字はやり取りに使うので空白にする

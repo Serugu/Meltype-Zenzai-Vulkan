@@ -22,10 +22,15 @@ def to_hiragana(text):
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in text)
 
 
-def meltype_context(text):
+def meltype_context(text, length=10):
     # CompositionController.ConversionContext と同じ: 最後の文の終わりより後ろの、末尾の 10 文字まで
     start = max(text.rfind(c) for c in SENTENCE_ENDS)
-    return text[start + 1:].strip()[-10:]
+    return text[start + 1:].strip()[-length:]
+
+
+def long_context(text):
+    # CompositionController.SentenceBefore(40): zenz にだけ渡す長い左の文脈
+    return meltype_context(text, 40)
 
 
 def main():
@@ -57,9 +62,11 @@ def main():
         return "\x1e".join(result)
 
     def write(name, rows):
+        # rows: (Mozc に渡す文脈, zenz に渡す左の文脈, 読み, 正解, zenz に渡す右の文脈)
         with open(os.path.join(outdir, name), "w", encoding="utf-8", newline="\n") as f:
-            for context, reading, answers in rows:
-                f.write(f"{context}\t{reading}\t{segments(context, reading)}\t{'|'.join(answers)}\n")
+            for mozc_context, zenz_context, reading, answers, right in rows:
+                line = f"{zenz_context}\t{reading}\t{segments(mozc_context, reading)}\t{'|'.join(answers)}"
+                f.write(line + (f"\t{right}" if right else "") + "\n")
         print(name, len(rows))
 
     for name in ("zenzai-cases", "zenzai-holdout"):
@@ -68,16 +75,34 @@ def main():
             for line in f:
                 if " / " in line:
                     answer, reading = line.strip().split(" / ")
-                    rows.append(("", reading, answer.split("|")))
+                    rows.append(("", "", reading, answer.split("|"), ""))
         write(name + ".tsv", rows)
 
     if ajimee:
         with open(ajimee, encoding="utf-8") as f:
             items = json.load(f)
-        rows = [(meltype_context(x["context_text"]), to_hiragana(x["input"]), x["expected_output"]) for x in items]
+
+        def right_of(x):
+            # 変換する部分の後ろの文 (同じ文の中、40 文字まで)。original_text の中で、左の文脈と答えの後ろ
+            original = x["original_text"]
+            for answer in x["expected_output"]:
+                at = original.find(x["context_text"] + answer)
+                if at >= 0:
+                    rest = original[at + len(x["context_text"]) + len(answer):]
+                    end = min([rest.find(c) for c in SENTENCE_ENDS if c in rest] or [len(rest)])
+                    return rest[:end][:40]
+            return ""
+
+        # Meltype と同じく、Mozc にも zenz にも左の文脈を 10 文字だけ渡す
+        short = [(meltype_context(x["context_text"]), meltype_context(x["context_text"]), to_hiragana(x["input"]), x["expected_output"], "") for x in items]
+        # Mozc には 10 文字、zenz には 40 文字
+        long = [(meltype_context(x["context_text"]), long_context(x["context_text"]), to_hiragana(x["input"]), x["expected_output"], "") for x in items]
+        # さらに zenz に右の文脈 (文の途中を打ち直すとき)
+        right = [(m, z, r, a, right_of(x)) for (m, z, r, a, _), x in zip(long, items)]
         # 重みを決める用と確かめる用に半分ずつ (文脈あり・なしが半々になるよう、交互に分ける)
-        write("ajimee-tune.tsv", rows[0::2])
-        write("ajimee-test.tsv", rows[1::2])
+        for suffix, rows in (("", short), ("-ctx40", long), ("-ctx40-right", right)):
+            write(f"ajimee-tune{suffix}.tsv", rows[0::2])
+            write(f"ajimee-test{suffix}.tsv", rows[1::2])
 
     mozc.stdin.write(b"Q\n")
     mozc.stdin.flush()
