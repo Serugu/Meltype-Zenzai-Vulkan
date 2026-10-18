@@ -1,0 +1,61 @@
+name: sponsors
+
+# README の「寄付してくださった方々」を GitHub Sponsors の一覧から作り直し、変わっていれば Pull Request を出す。
+# 名前を公開にしてくださった方だけを載せる (.github/bot/sponsors.mjs)。main には直接 push しない。
+#
+# 一覧を読むトークン: 秘密 SPONSORS_TOKEN があればそれを使う (yksr-melt のトークン。classic なら read:user、
+# fine-grained なら「Account permissions → GitHub Sponsors: read」)。無ければ github.token で試す
+# (公開のスポンサーだけなら読めることがあるが、読めなければ失敗する)。
+# Pull Request を出すトークン: bot の GitHub App (vars.BOT_APP_ID) があればそれ (CI も流れる)、無ければ github.token。
+on:
+  schedule:
+    - cron: '43 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sponsors
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - id: app-token
+        if: vars.BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      - name: Update README from GitHub Sponsors
+        env:
+          GITHUB_TOKEN: ${{ secrets.SPONSORS_TOKEN || github.token }}
+        run: |
+          node .github/bot/sponsors.mjs --self-test
+          node .github/bot/sponsors.mjs
+      - name: Open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "寄付してくださった方々は変わっていません"
+            exit 0
+          fi
+          branch=bot/sponsors
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git commit -m "README: 寄付してくださった方々を更新する (GitHub Sponsors)" -- README.md
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$branch"
+          if [[ -z "$(gh pr list --repo "$REPO" --head "$branch" --state open --json number --jq '.[].number')" ]]; then
+            gh pr create --repo "$REPO" --base main --head "$branch" \
+              --title "README: 寄付してくださった方々を更新する" \
+              --body "GitHub Sponsors で名前を公開にして応援してくださった方を、README の「寄付してくださった方々」に足しました。sponsors ワークフローが毎日確認して出しています。"
+          fi

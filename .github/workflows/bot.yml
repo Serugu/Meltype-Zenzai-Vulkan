@@ -3,6 +3,7 @@
 #   コメントの 1 行目のコマンド:
 #     だれでも: /repro /explain /ca /jht /help
 #     メンテナー (PR のみ): /test /pack /test-repro /test-jht /test-explain
+#     管理者: /release <版> /pre-release <版> (タグとリリースの下書きを作り、配布物のビルドを始める)
 # Issue・コメントの文は誰でも書けるので、run: の中に ${{ }} で埋め込まず、環境変数で値として渡す。
 # Pull Request のコードは、書き込みの権限を持たない job (pr) でだけ動かす。結果のコメントは別の job (report) が書く。
 # 漢字変換には最新リリースの meltype_mozc_helper を使う (毎回 Bazel ビルドしない)。
@@ -63,6 +64,8 @@ jobs:
       issues: write
       pull-requests: write
     outputs:
+      release_command: ${{ steps.parse.outputs.release_command }}
+      release_version: ${{ steps.parse.outputs.release_version }}
       action: ${{ steps.parse.outputs.action }}
       issue: ${{ steps.parse.outputs.issue }}
       keys: ${{ steps.parse.outputs.keys }}
@@ -87,6 +90,34 @@ jobs:
         run: node .github/bot/meltype-bot.mjs parse
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token || github.token }}
+
+  # /release・/pre-release (管理者だけ): タグとリリースの下書きを作り、配布物のビルドを始める。
+  # 書き込みの権限はこの job だけに付ける (parse はだれのコメントでも動くため)。管理者かどうかは、書き込みの前に確かめる
+  release:
+    needs: parse
+    if: needs.parse.outputs.release_command != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: write
+      issues: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: .github/bot
+          persist-credentials: false
+      - id: app
+        if: vars.BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      - run: node .github/bot/meltype-bot.mjs release
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          BOT_RELEASE_COMMAND: ${{ needs.parse.outputs.release_command }}
+          BOT_RELEASE_VERSION: ${{ needs.parse.outputs.release_version }}
 
   # main 上での repro / explain / ca / jht
   run:

@@ -1,15 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
+    <!-- Exe: cmd が version 表示を待つ。常駐起動は Program がコンソールから切り離して立ち上げ直す。 -->
+    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Meltype</AssemblyName>
     <RootNamespace>Meltype</RootNamespace>
-    <Version>1.2.1</Version>
+    <Version>1.2.2-pre.2</Version>
     <!-- Zenzai を足した自前ビルド。版を「公開版」の形 (x.y.z) にしないので、公式の自動更新で上書きされない (Updater は公開版だけ更新を確かめる) -->
-    <InformationalVersion>1.2.1-zenzai</InformationalVersion>
+    <InformationalVersion>1.2.2-pre.2-zenzai</InformationalVersion>
     <Product>Meltype</Product>
     <Authors>Yukishiro</Authors>
     <Copyright>Copyright (C) 2026 雪代 / Yukishiro. GPL-3.0-or-later</Copyright>
