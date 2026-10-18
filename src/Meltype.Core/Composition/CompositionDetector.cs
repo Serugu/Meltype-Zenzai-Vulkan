@@ -292,6 +292,8 @@ public sealed partial class CompositionDetector
         var restLower = segments[1].Raw.ToLowerInvariant();
         if (Detection.DictionaryDetector.StartsWithParticle(restLower) is not null) return false;
         var lowerWhole = whole.ToLowerInvariant();
+        // 残りが最後までローマ字として読めるなら、英単語 + 日本語 (url + machigaeta = urlまちがえた)。全体を英字にしない
+        if (_romaji.Analyze(lowerWhole[head.Length..]) is { IsValid: true, Partial: "" or "n" }) return false;
         for (var len = head.Length + 1; len <= lowerWhole.Length; len++)
             if (IsKnownEnglishWord(lowerWhole[..len])) return false;
         return segments.Skip(1).All(s => !s.IsEnglish && s.Raw.All(char.IsAsciiLetter));
@@ -606,6 +608,20 @@ public sealed partial class CompositionDetector
 
     private static int Score(bool? english) => english switch { true => 1, false => -1, null => 0 };
 
+    /// <summary>
+    /// c 行の綴り (face の c、teach の ch) があるか。ch の後ろに母音が続く ち・ちゃ 行の c (machi、cha) は、日本語のローマ字でも使うので数えない。
+    /// </summary>
+    private static bool HasCRowLetter(string lower)
+    {
+        for (var i = 0; i < lower.Length; i++)
+        {
+            if (lower[i] != 'c') continue;
+            if (i + 2 < lower.Length && lower[i + 1] == 'h' && lower[i + 2] is 'a' or 'i' or 'u' or 'e' or 'o') continue;
+            return true;
+        }
+        return false;
+    }
+
     /// <summary>英文の中では半角のままにする記号。[ ] は日本語の入力では「」なので含めない (英単語の後ろでも「」: bot「Thinking」)。</summary>
     private static bool IsAsciiSymbol(CompositionUnit unit) =>
         unit.Raw.Length == 1 && unit.Raw[0] is >= '!' and <= '~' && !char.IsAsciiLetterOrDigit(unit.Raw[0]) && unit.Raw[0] is not ('[' or ']');
@@ -724,8 +740,10 @@ public sealed partial class CompositionDetector
             // ただし、入力の先頭 (か英語の後ろ) の 4 文字以上の英単語 (同梱の辞書・スペルチェッカー) のすぐ後ろが助詞なら、英単語 + 助詞 (face|ni → faceに。ふぁせに になっていた: issue #379)
             var englishThenParticle = (inDictionary || knownSpelling) && lower.Length >= 4 && before >= 0 && next is { Length: > 0 } &&
                 Detection.DictionaryDetector.StartsWithParticle(next.ToLowerInvariant()) is not null;
-            // c で綴った語 (face) は、日本語を打つつもりなら k・s を使うので、英単語として扱う
-            if (lower.Contains('c') && englishThenParticle) return true;
+            // c で綴った語 (face) は、日本語を打つつもりなら k・s を使うので、英単語として扱う。
+            // ただしスペルチェッカーだけが知っている語の ち・ちゃ 行の c (machi の chi) は、日本語でも使う綴りなので数えない
+            // (url|machi|ga が urlmachiがえた になっていた)。同梱の辞書の英単語 (machine、kitchen) は今までどおり
+            if ((inDictionary ? lower.Contains('c') : HasCRowLetter(lower)) && englishThenParticle) return true;
             if (lower.Contains('c') && _romaji.Analyze(RomajiDetector.ReadCRow(lower)) is { IsValid: true, Partial: "" or "n" }) return false;
             // v 行 (va = ゔぁ): 辞書の英単語 (video) でなければ日本語 (vanpaia → ゔぁんぱいあ → ヴァンパイア)。
             // スペルチェッカーの 5 文字以上の英単語 (invite、private) は、ゔぃ と読める綴りでも英語 (いんviteしました になっていた: issue #69)。

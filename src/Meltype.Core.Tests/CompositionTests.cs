@@ -1567,6 +1567,18 @@ internal static class CompositionTests
     }
 
     [Test]
+    public static void ShortEnglishWord_ThenReadableJapanese_StaysSplit()
+    {
+        // 辞書の短い英単語 (url) の後ろが最後までローマ字として読めるなら、#537 のように全体を英字にしない (urlmachigaeta になっていた)
+        foreach (var (typed, expected) in new[] { ("urlmachigaeta", "urlまちがえた"), ("urlnaosu", "urlなおす") })
+        {
+            var k = new Keyboard();
+            k.Type(typed + "\n");
+            Assert.Equal(expected, k.Host.Document, typed);
+        }
+    }
+
+    [Test]
     public static void Issue506_EnumerateStaysEnglish()
     {
         var k = new Keyboard();
