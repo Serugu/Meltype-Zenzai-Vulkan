@@ -12,12 +12,26 @@ namespace Meltype.Composition;
 /// Zenzai が有効なら、Mozc の文節ごとの候補から zenz が組み合わせを選び直す (選べなければ Mozc の 1 番目の候補)。
 /// </summary>
 public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter? mozc, IKanjiConverter system,
-    Func<string, IReadOnlyList<string>>? systemCandidates, ZenzaiReranker? zenzai = null, Func<bool>? useZenzai = null)
-    : IKanjiConverter, ILearningConverter
+    Func<string, IReadOnlyList<string>>? systemCandidates, ZenzaiReranker? zenzai = null, Func<bool>? useZenzai = null,
+    Func<string, string?>? learned = null)
+    : IKanjiConverter, ILearningConverter, ILiveConversionAware
 {
     private bool UseMozc => engine() != ConversionEngine.System && mozc is { IsAvailable: true };
     private bool UseSystem => engine() != ConversionEngine.Mozc || mozc is not { IsAvailable: true };
     private bool UseZenzai => UseMozc && zenzai is not null && (useZenzai?.Invoke() ?? false);
+
+    /// <summary>ライブ変換の間は true (Zenzai を短く待ち、間に合わなければ <see cref="Updated"/> で知らせる)。</summary>
+    public bool Live { get; set; }
+
+    public event Action? Updated
+    {
+        add { if (zenzai is not null) zenzai.ResultReady += value; }
+        remove { if (zenzai is not null) zenzai.ResultReady -= value; }
+    }
+
+    /// <summary>Zenzai を使うときだけ、Mozc の区切りを返す (Mozc の結果は控えがあるので速い。選び直しは頼まない)。</summary>
+    public IReadOnlyList<string>? SegmentReadings(string hiragana, string? context) =>
+        UseZenzai && mozc!.Segments(hiragana, context) is { Count: > 0 } segments ? segments.Select(s => s.Reading).ToList() : null;
 
     public string? Convert(string hiragana) =>
         UseZenzai
@@ -34,8 +48,8 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     {
         if (mozc!.Segments(hiragana, context) is not { Count: > 0 } segments) return null;
         var candidates = segments.Select(s => s.Candidates.Count > 0 ? s.Candidates : [s.Reading])
-            .Select((list, i) => Plausible(segments[i].Reading, list)).ToList();
-        if (zenzai!.Choose(context, hiragana, candidates) is not { } picks || picks.Length != segments.Count) return null;
+            .Select((list, i) => Learned(segments[i].Reading, Plausible(segments[i].Reading, list))).ToList();
+        if (zenzai!.Choose(context, hiragana, candidates, Live) is not { } picks || picks.Length != segments.Count) return null;
         var clauses = new List<ConversionClause>(segments.Count);
         for (var i = 0; i < segments.Count; i++)
         {
@@ -44,6 +58,16 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
         }
         return clauses;
     }
+
+    /// <summary>
+    /// ユーザーが前に選び直した語 (conversions.json) を 1 番目の候補にして zenz に渡す。zenz は Mozc の順位も点数に入れるので、
+    /// 覚えた語が選ばれやすくなり、ほかの文節もその語に合わせて選ばれる (選んだあとにも、変換ボックスが覚えた語を最初の候補にする)。
+    /// </summary>
+    private IReadOnlyList<string> Learned(string reading, IReadOnlyList<string> candidates) => PreferLearned(learned?.Invoke(reading), candidates);
+
+    /// <summary>覚えた語が候補にあれば 1 番目にする (無ければそのまま)。</summary>
+    internal static IReadOnlyList<string> PreferLearned(string? text, IReadOnlyList<string> candidates) =>
+        text is null || candidates[0] == text || !candidates.Contains(text) ? candidates : [text, .. candidates.Where(c => c != text)];
 
     /// <summary>
     /// 読みの前の部分だけの候補を除く。Mozc の候補には、送り仮名を落とした候補 (はこぶ → 運ぶ・運) も混じり、

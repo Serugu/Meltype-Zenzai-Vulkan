@@ -184,15 +184,17 @@ internal sealed record Options(string Model, string Backend, int IdleExitMinutes
             Value("--model") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Meltype", "zenz", "zenz-v3.2-small-Q5_K_M.gguf"),
             (Value("--backend") ?? "vulkan").ToLowerInvariant(),
             Int("--idle-exit", 10),
-            Math.Clamp(Int("--beam", 4), 1, 16),
+            // 既定の値は AJIMEE-Bench (azooKey の変換の評価データ、200 問) と tools/zenzai-*.txt で決めた。
+            // ビーム幅 4 と 2 で正解数はほぼ同じで、2 のほうが 2〜3 割速い
+            Math.Clamp(Int("--beam", 2), 1, 16),
             Math.Clamp(Int("--candidates", 8), 1, 16),
-            Float("--rank-weight", 0.5f),
+            Float("--rank-weight", 0.75f),
             Value("--bench"),
             Math.Clamp(Int("--ctx", 1024), 256, 8192),
             Math.Clamp(Int("--batch", 1024), 64, 8192),
             Value("--cache") != "f16",
             !args.Contains("--no-mmap"),
             !args.Contains("--no-trim"),
-            Float("--kana-penalty", 2f));
+            Float("--kana-penalty", 1f));
     }
 }

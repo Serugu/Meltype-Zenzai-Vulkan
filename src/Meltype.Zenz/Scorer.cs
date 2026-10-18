@@ -32,6 +32,8 @@ internal sealed class Scorer : IDisposable
     private readonly float _rankWeight;
     private readonly float _kanaPenalty;
     private readonly LLamaToken _eos;
+    // プロンプトを入れておく系列 (ビームと計算用の系列の後ろ)
+    private readonly LLamaSeqId _promptSequence;
 
     public string Backend { get; }
 
@@ -43,6 +45,7 @@ internal sealed class Scorer : IDisposable
         _maxCandidates = options.MaxCandidates;
         _rankWeight = options.RankWeight;
         _kanaPenalty = options.KanaPenalty;
+        _promptSequence = (LLamaSeqId)(options.Beam + options.Beam * options.MaxCandidates);
         _eos = weights.Vocab.EOS ?? throw new InvalidOperationException("モデルに文の終わりのトークンがありません");
         Backend = backend;
     }
@@ -63,8 +66,9 @@ internal sealed class Scorer : IDisposable
 
         var parameters = new ModelParams(options.Model)
         {
-            // 系列 0..beam-1 がビーム、残りが「ビーム × 候補」の計算用。プロンプトの KV はすべての系列で共有する (KVUnified)。
-            SeqMax = (uint)(options.Beam + options.Beam * options.MaxCandidates),
+            // 系列 0..beam-1 がビーム、その次が「ビーム × 候補」の計算用、最後がプロンプト (頼みをまたいで残す)。
+            // プロンプトの KV はすべての系列で共有する (KVUnified)。
+            SeqMax = (uint)(options.Beam + options.Beam * options.MaxCandidates + 1),
             KVUnified = true,
             ContextSize = (uint)options.ContextSize,
             BatchSize = (uint)options.BatchSize,
@@ -99,18 +103,61 @@ internal sealed class Scorer : IDisposable
         if (segments.All(s => s.Count == 1)) return new int[segments.Count];
 
         var handle = _context.NativeHandle;
-        handle.MemoryClear(true);
 
         // プロンプト (zenz-v3 の形。左の文脈は末尾の 40 文字まで)
         var trimmed = leftContext.Length > MaxContextLength ? leftContext[^MaxContextLength..] : leftContext;
         var prompt = (trimmed.Length > 0 ? ContextTag + Preprocess(trimmed) : "") + InputTag + ToKatakana(Preprocess(reading)) + OutputTag;
         var promptTokens = _context.Tokenize(prompt, true, false);
-        _batch.Clear();
-        _batch.AddRange(promptTokens, 0, (LLamaSeqId)0, true);
-        if (handle.Decode(_batch) != DecodeResult.Ok) return null;
+        if (EvaluatePrompt(promptTokens) is not { } promptNext) return null;
 
-        var beams = new List<Hypothesis> { new(0, 0, [], promptTokens.Length, LogSoftmax(handle.GetLogitsIth(promptTokens.Length - 1))) };
+        // ビームの系列 0 はプロンプトの系列をコピーして始める (KV のセルは共有され、コピーはしない)
+        handle.MemorySequenceCopy(_promptSequence, (LLamaSeqId)0, -1, -1);
+        var beams = new List<Hypothesis> { new(0, 0, [], promptTokens.Length, promptNext) };
         var scratchBase = _beam;
+        try
+        {
+            return Search(handle, segments, beams, scratchBase);
+        }
+        finally
+        {
+            // プロンプトの系列だけ残して、ほかの系列を消す (次の頼みでプロンプトの KV を使い回す)
+            for (var s = 0; s < scratchBase + _beam * _maxCandidates; s++) handle.MemorySequenceRemove((LLamaSeqId)s, -1, -1);
+        }
+    }
+
+    // 前の頼みのプロンプトのトークンと、その最後の位置の対数確率 (次のトークンの予測)
+    private LLamaToken[] _cachedPrompt = [];
+    private float[]? _cachedPromptNext;
+
+    /// <summary>
+    /// プロンプトを計算して、最後の位置の対数確率を返す。前の頼みのプロンプトと先頭が同じ部分は、KV を残して計算し直さない
+    /// (ライブ変換では 1 文字打つごとに、読みが伸びただけのプロンプトを頼まれる)。
+    /// </summary>
+    private float[]? EvaluatePrompt(LLamaToken[] tokens)
+    {
+        var handle = _context.NativeHandle;
+        var common = 0;
+        while (common < tokens.Length && common < _cachedPrompt.Length && tokens[common] == _cachedPrompt[common]) common++;
+        if (common == tokens.Length && common == _cachedPrompt.Length && _cachedPromptNext is not null) return _cachedPromptNext;
+        // 最後のトークンの予測が要るので、少なくとも 1 つは計算し直す
+        if (common == tokens.Length) common--;
+        handle.MemorySequenceRemove(_promptSequence, common, -1);
+        _batch.Clear();
+        for (var i = common; i < tokens.Length; i++) _batch.Add(tokens[i], i, _promptSequence, i == tokens.Length - 1);
+        if (handle.Decode(_batch) != DecodeResult.Ok)
+        {
+            handle.MemoryClear(true);
+            _cachedPrompt = [];
+            _cachedPromptNext = null;
+            return null;
+        }
+        _cachedPrompt = tokens;
+        _cachedPromptNext = LogSoftmax(handle.GetLogitsIth(_batch.TokenCount - 1));
+        return _cachedPromptNext;
+    }
+
+    private int[]? Search(SafeLLamaContextHandle handle, IReadOnlyList<IReadOnlyList<string>> segments, List<Hypothesis> beams, int scratchBase)
+    {
 
         foreach (var segment in segments)
         {
@@ -132,7 +179,8 @@ internal sealed class Scorer : IDisposable
                     slots.Add((beams[b], k, sequence, first, tokens.Length));
                 }
             }
-            if (slots.Count == 0) return null;
+            // 1 回のバッチに入りきらない (ビーム幅・候補の数を大きくしたときの長い文) なら選ばない (Mozc の結果になる)
+            if (slots.Count == 0 || _batch.TokenCount > (int)handle.BatchSize) return null;
             if (handle.Decode(_batch) != DecodeResult.Ok) return null;
 
             var scored = new List<Hypothesis>(slots.Count);

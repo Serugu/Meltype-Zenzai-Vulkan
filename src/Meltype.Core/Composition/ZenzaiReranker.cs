@@ -11,8 +11,12 @@ namespace Meltype.Composition;
 /// <param name="ModelPath">zenz の重み (gguf)。</param>
 /// <param name="Backend">vulkan / cpu。</param>
 /// <param name="IdleExitMinutes">使わない時間がこれだけ続いたら、ヘルパーが終了して VRAM・メモリを空ける (0 なら終了しない)。</param>
-/// <param name="TimeoutMs">1 回の選び直しを待つ時間。間に合わなければ Mozc の結果を使う (変換は UI スレッドで動くので短くする)。</param>
-public sealed record ZenzaiOptions(string ModelPath, string Backend, int IdleExitMinutes, int TimeoutMs)
+/// <param name="TimeoutMs">Space で変換したときに、1 回の選び直しを待つ時間。間に合わなければ Mozc の結果を使う (変換は UI スレッドで動くので短くする)。</param>
+/// <param name="LiveTimeoutMs">
+/// ライブ変換 (打つたびの変換) で待つ時間。間に合わなければ Mozc の結果を見せ、zenz の結果が届いたら <see cref="ZenzaiReranker.ResultReady"/> で知らせる
+/// (打つのを待たせない。測ると 1 回の選び直しは p50 約 11ms・p95 約 23ms なので、ほとんどは待つうちに間に合う)。
+/// </param>
+public sealed record ZenzaiOptions(string ModelPath, string Backend, int IdleExitMinutes, int TimeoutMs, int LiveTimeoutMs = 25)
 {
     /// <summary>重みの既定の置き場所 (%LOCALAPPDATA%\Meltype\zenz\)。</summary>
     public static string DefaultModelPath => Path.Combine(Config.AppPaths.DataDirectory, "zenz", "zenz-v3.2-small-Q5_K_M.gguf");
@@ -46,6 +50,8 @@ public sealed class ZenzaiReranker : IDisposable
     private Task? _starting;
     // 待ちきれなかった頼み (その頼みの控えのキーと、返事を読む Task)。返事が来たら控えに入れ、来るまでは次を頼まない
     private (string Key, Task<string?> Reply)? _pending;
+    // _pending の返事が届いたら ResultReady で知らせるか (ライブ変換で、結果を返せなかった頼みがあった)
+    private bool _wantsNotice;
     private int _failures;
     private bool _missingDependency;
     private bool _disposed;
@@ -76,32 +82,67 @@ public sealed class ZenzaiReranker : IDisposable
     public bool IsAvailable => IsInstalled && _failures < 3 && !_missingDependency;
 
     /// <summary>
+    /// 待ちきれなかった選び直しの結果が、あとから届いた (UI スレッドとは限らない)。ライブ変換の表示を作り直すのに使う
+    /// (もう一度同じ読みで頼むと、控えから結果が返る)。
+    /// </summary>
+    public event Action? ResultReady;
+
+    // 調べる用の回数 (頼んだ・控えから返した・前の返事を待っていて頼めなかった・間に合わなかった・あとから届いて知らせた)
+    private long _requests, _cacheHits, _busy, _late, _notified;
+
+    /// <summary>調べる用の回数。</summary>
+    public string Statistics => $"頼んだ {_requests}・控え {_cacheHits}・前の返事待ち {_busy}・間に合わず {_late}・あとから知らせた {_notified}";
+
+    /// <summary>
     /// 文節ごとに選んだ候補の番号。準備中・間に合わない・失敗したときは null。
     /// candidates は文節ごとの候補 (Mozc の順。どの文節にも 1 つ以上ある)。
+    /// live はライブ変換 (打つたびの変換) のとき。待つ時間を短くし、間に合わなければ結果が届いたときに <see cref="ResultReady"/> で知らせる。
     /// </summary>
-    public int[]? Choose(string? context, string reading, IReadOnlyList<IReadOnlyList<string>> candidates)
+    public int[]? Choose(string? context, string reading, IReadOnlyList<IReadOnlyList<string>> candidates, bool live = false)
     {
         if (candidates.Count == 0 || candidates.Any(c => c.Count == 0)) return null;
         if (candidates.All(c => c.Count == 1)) return new int[candidates.Count];
         if (!IsAvailable) return null;
         var request = $"E\t{Clean(context ?? "")}\t{Clean(reading)}\t{string.Join(RecordSeparator, candidates.Select(c => string.Join(UnitSeparator, c.Select(Clean))))}";
+        var options = _options();
+        var budget = Math.Max(5, live ? options.LiveTimeoutMs : options.TimeoutMs);
+        var started = Stopwatch.GetTimestamp();
+        int Remaining() => Math.Max(0, budget - (int)Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         lock (_gate)
         {
             if (_disposed) return null;
-            if (_results.TryGetValue(request, out var known)) return known;
+            if (_results.TryGetValue(request, out var known))
+            {
+                _cacheHits++;
+                return known;
+            }
             if (Ready() is not { } process) return null;
-            if (!CollectPending(0)) return null;
-            if (_results.TryGetValue(request, out known)) return known;
+            // 前の頼みの返事を待っている (ヘルパーは 1 つずつ計算する)。待つ時間のうちに来なければ、今回は Mozc の結果
+            if (!CollectPending(Remaining()))
+            {
+                _busy++;
+                // 前の返事が届いたら知らせてもらう (届いたあとに作り直せば、この読みを頼める)
+                if (live) _wantsNotice = true;
+                return null;
+            }
+            if (_results.TryGetValue(request, out known))
+            {
+                _cacheHits++;
+                return known;
+            }
             try
             {
+                _requests++;
                 var reply = process.StandardOutput.ReadLineAsync();
                 process.StandardInput.Write(request + "\n");
                 process.StandardInput.Flush();
-                var timeout = Math.Max(10, _options().TimeoutMs);
-                if (!reply.Wait(timeout))
+                if (!reply.Wait(Remaining()))
                 {
-                    // 遅かった。返事はあとで控えに入れる (同じ読みはライブ変換で何度も頼まれるので、次のキーで使える)
+                    // 遅かった。返事はあとで控えに入れ、届いたら知らせる (表示を作り直すと、控えから結果が返る)
+                    _late++;
+                    _wantsNotice = live;
                     _pending = (request, reply);
+                    reply.ContinueWith(_ => OnLateReply(reply), TaskScheduler.Default);
                     return null;
                 }
                 return Remember(request, Parse(reply.Result, candidates.Count));
@@ -139,6 +180,29 @@ public sealed class ZenzaiReranker : IDisposable
     public void ClearCache()
     {
         lock (_gate) _results.Clear();
+    }
+
+    /// <summary>待ちきれなかった返事が届いた: 控えに入れて知らせる (次の頼みがもう受け取っていれば何もしない)。</summary>
+    private void OnLateReply(Task<string?> reply)
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            if (_pending is { } pending && pending.Reply == reply) CollectPending(0);
+            // ライブ変換で間に合わなかった・前の返事を待っていて頼めなかった頼みがあれば知らせる
+            // (次の頼みが先にこの返事を受け取っていても、知らせて作り直してもらう。作り直しは控えを使うので軽い)
+            if (!_wantsNotice) return;
+            _wantsNotice = false;
+            _notified++;
+        }
+        try
+        {
+            ResultReady?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Diagnostics.Log.Warn($"Zenzai の結果を表示に反映できませんでした: {ex.Message}");
+        }
     }
 
     /// <summary>待ちきれなかった返事が来ていれば控えに入れる (_gate の中で呼ぶ)。まだ来ていなければ false。</summary>

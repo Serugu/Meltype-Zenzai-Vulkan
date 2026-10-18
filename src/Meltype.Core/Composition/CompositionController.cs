@@ -1570,6 +1570,12 @@ public sealed class CompositionController
     /// </summary>
     private IReadOnlyList<ConversionClause>? ConvertWithContext(string kana, string context)
     {
+        // 区切りだけを先に比べられる変換エンジン (Zenzai) なら、選び直しは使う方の 1 回だけ頼む
+        if (_converter is ILiveConversionAware aware
+            && aware.SegmentReadings(kana, context) is { } withContextReadings && aware.SegmentReadings(kana, null) is { } plainReadings)
+        {
+            return _converter.ConvertClauses(kana, withContextReadings.SequenceEqual(plainReadings) ? context : null);
+        }
         var withContext = _converter.ConvertClauses(kana, context);
         var plain = _converter.ConvertClauses(kana);
         if (withContext is null || plain is null) return withContext ?? plain;
@@ -1918,10 +1924,33 @@ public sealed class CompositionController
         if (kana.Length < LiveConversionMinLength) return kana;
         var key = string.Join("\u0001", kana, _precedingText, _followingText, _options.History?.Version);
         if (_liveCache.TryGetValue(key, out var cached)) return cached;
-        var converted = string.Concat(ConvertJapanese(kana).Select(c => c.Text));
+        // 変換エンジンに「ライブ変換」と伝える (Zenzai は短く待ち、間に合わなければあとで RefreshLiveConversion を呼んでもらう)
+        var aware = _converter as ILiveConversionAware;
+        var wasLive = aware?.Live ?? false;
+        if (aware is not null) aware.Live = true;
+        string converted;
+        try
+        {
+            converted = string.Concat(ConvertJapanese(kana).Select(c => c.Text));
+        }
+        finally
+        {
+            if (aware is not null) aware.Live = wasLive;
+        }
         if (_liveCache.Count > 256) _liveCache.Clear();
         _liveCache[key] = converted;
         return converted;
+    }
+
+    /// <summary>
+    /// 変換エンジンの結果があとから良くなった (Zenzai の選び直しが届いた) とき: ライブ変換の表示を作り直す。
+    /// Space で変換した後 (文節・候補を選んでいる間) は、選んでいるものが変わらないように何もしない。UI スレッドで呼ぶ。
+    /// </summary>
+    public void RefreshLiveConversion()
+    {
+        _liveCache.Clear();
+        _conversionCache.Clear();
+        if (!_converting && !_text.IsEmpty && _options.LiveConversion()) UpdateView();
     }
 
     /// <summary>今の表示 (ライブ変換が有効なら日本語区間は漢字に変換済み)。</summary>

@@ -257,7 +257,7 @@ public sealed class Settings
     public int ZenzaiIdleExitMinutes { get; set; } = 10;
 
     [Category("1. 全般"), DisplayName("Zenzai を待つ時間 (ms)"),
-     Description("1 回の選び直しを待つ時間です。間に合わなかったら Mozc の結果を見せ、zenz の結果は次のキーで使います。長くすると打ったときの反応が遅れることがあります。")]
+     Description("Space で変換したときに、1 回の選び直しを待つ時間です。間に合わなかったら Mozc の結果になります。長くすると Space の反応が遅れることがあります。ライブ変換 (打つたび) では 25ms だけ待ち、間に合わなければ Mozc の結果を見せてから、zenz の結果が届いたときに差し替えます。")]
     public int ZenzaiTimeoutMs { get; set; } = 80;
 
     [Category("1. 全般"), DisplayName("英訳の候補"),

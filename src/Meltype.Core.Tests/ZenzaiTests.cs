@@ -25,6 +25,16 @@ internal static class ZenzaiTests
     }
 
     [Test]
+    public static void PreferLearned_PutsTheLearnedWordFirst()
+    {
+        // 前に「観る」を選んでいたら、zenz に渡す候補でも 1 番目にする (Mozc の順位が点数に入るので選ばれやすくなる)
+        Assert.Equal("観る,見る,診る", string.Join(",", HybridConverter.PreferLearned("観る", ["見る", "観る", "診る"])));
+        // 覚えた語が候補に無い・覚えていないときはそのまま
+        Assert.Equal("見る,診る", string.Join(",", HybridConverter.PreferLearned("観る", ["見る", "診る"])));
+        Assert.Equal("見る,観る", string.Join(",", HybridConverter.PreferLearned(null, ["見る", "観る"])));
+    }
+
+    [Test]
     public static void Reranker_WithoutHelper_FallsBackToMozc()
     {
         var reranker = new ZenzaiReranker(Path.Combine(Path.GetTempPath(), "no-such-dir", "Meltype.Zenz.exe"),
@@ -97,6 +107,45 @@ internal static class ZenzaiCheck
             restarted = reranker.Choose("", "かんじへんかんのせいどをあげる", request);
         }
         Check(Show(restarted) == "漢字変換の精度を上げる", $"起動し直したあとも選び直せる: {Show(restarted)}");
+
+        // ライブ変換: 待つ時間を 1ms にしてわざと間に合わなくし、結果が届いたら表示が差し替わることを確かめる (MELTYPE_MOZC が要る)
+        if (Environment.GetEnvironmentVariable("MELTYPE_MOZC") is { Length: > 0 } mozcPath && File.Exists(mozcPath))
+        {
+            using var mozc = new MozcConverter(mozcPath, Path.Combine(Path.GetTempPath(), $"meltype-zenzai-check-{Environment.ProcessId}"));
+            var liveOptions = options with { LiveTimeoutMs = 1 };
+            using var live = new ZenzaiReranker(helper, () => liveOptions);
+            Check(live.WaitUntilReady(60000), "ライブ変換用に起動した");
+            var hybrid = new HybridConverter(() => Config.ConversionEngine.Mozc, mozc, new NoConverter(), null, live, () => true);
+            using var updated = new ManualResetEventSlim();
+            var updates = 0;
+            hybrid.Updated += () => { Interlocked.Increment(ref updates); updated.Set(); };
+            var keyboard = new CompositionTests.Keyboard(live: true, converter: hybrid, moreCandidates: hybrid.Candidates,
+                userDictionary: new UserDictionary(null), translations: TranslationDictionary.Load());
+            watch.Restart();
+            keyboard.Type("kanjihenkannnoseidowoageru");
+            var typedMs = watch.ElapsedMilliseconds;
+            var shown = keyboard.Host.View?.Text;
+            Check(shown is not null && shown != "漢字変換の精度を上げる", $"間に合わないうちは Mozc の結果を見せる: {shown} (26 キーで {typedMs}ms)");
+            // 結果が届くたびに作り直す (作り直すと、その時点の読みでまた頼むので、何回かで落ち着く)
+            for (var i = 0; i < 10 && keyboard.Host.View?.Text != "漢字変換の精度を上げる"; i++)
+            {
+                if (!updated.Wait(2000)) break;
+                updated.Reset();
+                keyboard.Controller.RefreshLiveConversion();
+                Console.WriteLine($"    作り直し {i + 1}: {keyboard.Host.View?.Text}  ({live.Statistics})");
+            }
+            Check(keyboard.Host.View?.Text == "漢字変換の精度を上げる", $"結果が届いたら差し替わる: {keyboard.Host.View?.Text} (知らせ {updates} 回。{live.Statistics})");
+        }
+        else
+        {
+            Console.WriteLine("--  ライブ変換の差し替えは MELTYPE_MOZC が無いので確かめない");
+        }
         return failures == 0 ? 0 : 1;
+    }
+
+    private sealed class NoConverter : IKanjiConverter
+    {
+        public string? Convert(string hiragana) => null;
+        public IReadOnlyList<ConversionClause>? ConvertClauses(string hiragana, string? context = null) => null;
     }
 }

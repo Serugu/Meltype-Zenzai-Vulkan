@@ -85,12 +85,19 @@ internal sealed class CompositionService : ICompositionHost, IDisposable
         TranslationHistory = resolved.TranslationHistory;
         var zenzaiOptions = options.ZenzaiOptions ?? (() => new ZenzaiOptions(ZenzaiOptions.DefaultModelPath, "vulkan", 10, 80));
         _zenzai = new ZenzaiReranker(Path.Combine(AppContext.BaseDirectory, "zenz", "Meltype.Zenz.exe"), zenzaiOptions);
-        _hybrid = new HybridConverter(options.Engine, _mozc, _converter, reading => _windowsCandidates.Get(reading), _zenzai, options.Zenzai);
+        _hybrid = new HybridConverter(options.Engine, _mozc, _converter, reading => _windowsCandidates.Get(reading), _zenzai, options.Zenzai,
+            reading => History.Get(reading));
         _resolved = resolved;
         Controller = new CompositionController(Gate, detector, _hybrid, this, resolved);
         Controller.Corrected += Corrections.Add;
         if (options.Engine() != Config.ConversionEngine.System && _mozc.IsInstalled) _mozc.WarmUp();
         if (options.Zenzai() && options.Engine() != Config.ConversionEngine.System) _zenzai.WarmUp();
+        // ライブ変換で間に合わなかった Zenzai の選び直しが届いたら、変換ボックスの表示を作り直す
+        // (Meltype IME はキーごとに表示を返すので、次のキーで反映される)
+        _hybrid.Updated += () =>
+        {
+            if (_invoker.IsHandleCreated && !_invoker.IsDisposed) _invoker.BeginInvoke(() => Safely(Controller.RefreshLiveConversion));
+        };
         _showIndicator = options.ModeIndicator;
         _placement = options.Placement;
         _size = options.Size;

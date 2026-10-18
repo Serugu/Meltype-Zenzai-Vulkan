@@ -35,25 +35,28 @@ function Start-Meltype {
     Start-Process -FilePath (Join-Path $app 'Meltype.exe') -WorkingDirectory $app
 }
 
+function Send-ToRecycleBin([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, 'OnlyErrorDialogs', 'SendToRecycleBin')
+}
+
 if ($Restore) {
     if (-not (Test-Path -LiteralPath $backup)) { throw "控えがありません ($backup)。" }
     Stop-Meltype
     foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $backup $dll) -Destination $app -Force }
-    $zenz = Join-Path $app 'zenz'
-    if (Test-Path -LiteralPath $zenz) {
-        Add-Type -AssemblyName Microsoft.VisualBasic
-        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($zenz, 'OnlyErrorDialogs', 'SendToRecycleBin')
-    }
+    Send-ToRecycleBin (Join-Path $app 'zenz')
     Start-Meltype
     Write-Host '公式の DLL に戻しました (zenz\ はごみ箱へ送りました。重みは残してあります)。'
     return
 }
 
 # ビルド (Meltype 本体は外部のパッケージを使わない。ヘルパーだけ nuget.org から LLamaSharp を取る)
-# 置き場所は dist\zenzai\ (Git には入れない)。毎回上書きするので、消さずに残す
+# 置き場所は dist\zenzai\ (Git には入れない)。ヘルパーは前の発行のファイルが残らないよう、前のものをごみ箱へ送ってから発行する
 $stage = Join-Path $root 'dist\zenzai'
 dotnet publish (Join-Path $root 'src\Meltype\Meltype.csproj') -c Release -o (Join-Path $stage 'app') -p:DebugType=none
 if ($LASTEXITCODE -ne 0) { throw 'Meltype をビルドできませんでした。' }
+Send-ToRecycleBin (Join-Path $stage 'zenz')
 dotnet publish (Join-Path $root 'src\Meltype.Zenz\Meltype.Zenz.csproj') -c Release -r win-x64 --self-contained -o (Join-Path $stage 'zenz') -p:DebugType=none
 if ($LASTEXITCODE -ne 0) { throw 'zenz のヘルパーをビルドできませんでした。' }
 
@@ -77,9 +80,10 @@ if (-not (Test-Path -LiteralPath $backup)) {
     foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $app $dll) -Destination $backup }
 }
 foreach ($dll in $dlls) { Copy-Item -LiteralPath (Join-Path $stage "app\$dll") -Destination $app -Force }
+# 前の版のヘルパーはごみ箱へ送ってから置く (前の版にだけあったファイルを残さない)
 $zenz = Join-Path $app 'zenz'
-New-Item -ItemType Directory -Force -Path $zenz | Out-Null
-Copy-Item -Path (Join-Path $stage 'zenz\*') -Destination $zenz -Recurse -Force
+Send-ToRecycleBin $zenz
+Copy-Item -LiteralPath (Join-Path $stage 'zenz') -Destination $zenz -Recurse
 
 if ($Enable -and (Test-Path -LiteralPath $config)) {
     $settings = Get-Content -LiteralPath $config -Raw -Encoding UTF8 | ConvertFrom-Json

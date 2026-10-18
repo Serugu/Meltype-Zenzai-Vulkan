@@ -16,7 +16,20 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <!-- 発行するときに使わない部分を削る (自己完結で約 150MB → 約 90MB。LLamaSharp はトリミングしても動くことを確かめた) -->
+    <PublishTrimmed>true</PublishTrimmed>
   </PropertyGroup>
+
+  <!--
+    LLamaSharp が同梱する llama.cpp のうち、使わないものを除く:
+    CPU 版は AVX2 と AVX なし (古い CPU 用) だけ残す (AVX-512 の CPU は AVX2 版で動く。AVX だけの CPU は AVX なし版で動く)。
+    mtmd.dll は画像・音声の入力用で、zenz では読み込まない。
+  -->
+  <Target Name="DropUnusedLlamaRuntimes" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <Content Remove="@(Content)" Condition="$([System.String]::Copy('%(Content.Link)').Contains('native\avx512\')) Or $([System.String]::Copy('%(Content.Link)').Contains('native\avx\')) Or '%(Content.Filename)' == 'mtmd'" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="LLamaSharp" Version="0.30.0" />
