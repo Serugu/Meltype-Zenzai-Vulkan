@@ -2502,11 +2502,10 @@ internal static class CompositionTests
                 Detector.UseScoredSegmentation = null;
             }
         }
-        // 略語 (IME) は区切りを点数で選ぶ (α版) では い + ME になる (別の問題) ので、通常の判定だけで確かめる
-        Assert.Equal("IME。", Type("IME.\n", on: true), "略語の後ろも句点");
         foreach (var scored in new[] { false, true })
         {
             var mode = scored ? " (点数で選ぶ)" : "";
+            Assert.Equal("IME。", Type("IME.\n", on: true, scored), "略語の後ろも句点" + mode);
             Assert.Equal("Google.", Type("Google.\n", on: false, scored), "OFF は半角のまま" + mode);
             Assert.Equal("Google。", Type("Google.\n", on: true, scored), "ON は句点" + mode);
             Assert.Equal("Google、", Type("Google,\n", on: true, scored), "ON は読点" + mode);
