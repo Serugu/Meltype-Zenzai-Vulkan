@@ -95,7 +95,11 @@ log stream --predicate 'process == "Meltype"' --level debug
 "$HOME/Library/Input Methods/Meltype.app/Contents/MacOS/Meltype" --register-input-source
 ```
 
-ほかの入力ソースはそのまま残します。整理する前の一覧は、`com.apple.HIToolbox` の設定の `MeltypeInputSourcesBeforeRepair` に控えておきます。
+OS の登録 API で登録・有効化した後、`com.apple.HIToolbox` の `AppleEnabledInputSources` と `com.apple.inputsources` の `AppleEnabledThirdPartyInputSources` を読み、Meltype がある各一覧の中で親と日本語モードの重複を除きます。最初の項目の位置と付随情報、ほかの入力ソースを保持します。OS の版番号で保存先を作ったり、保存先をまたいで登録を移したりはしません。両方に Meltype がある場合は、それぞれの登録を残します。
+
+変更前の一覧は、変更する設定領域ごとに `MeltypeInputSourcesBeforeRepair` に保存します。有効な日本語モードが一件になるまで最大約 2 秒待ち、一件なら入力メニューを更新します。反映待ちの場合は件数と対処方法を表示して終了コード 0 で終了し、入力メニューを再起動しません。設定の形式・保存・登録 API の失敗は終了コード 1 にします。同じコマンドを繰り返しても一覧内の重複は増えません。保存先をまたぐ登録の統合は行わないため、実メニューが必ず一件になるとは限りません。
+
+入力ソースが消えた場合の `MeltypeRegisterInputSource` による復旧手順は、[Mac 版の「困ったとき」](../mac/README.md#困ったとき) を参照してください。
 
 <br>
 

@@ -102,8 +102,13 @@ if [[ $setup -eq 1 ]]; then
         gir1.2-ibus-1.0 zlib1g-dev libdbus-1-dev libglib2.0-dev libgtk-3-dev \
         libxcb-xfixes0-dev qt6-base-dev
     if ! command -v dotnet >/dev/null 2>&1; then
-        curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-        bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet"
+        # /tmp の固定名は別ユーザーに差し替えられるので、自分専用の一時ディレクトリに置く。
+        dotnet_tmp="$(mktemp -d)"
+        trap 'rm -rf "$dotnet_tmp"' EXIT
+        curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$dotnet_tmp/dotnet-install.sh"
+        bash "$dotnet_tmp/dotnet-install.sh" --channel 10.0 --install-dir "$HOME/.dotnet"
+        rm -rf "$dotnet_tmp"
+        trap - EXIT
         echo 'Add this to your shell profile if dotnet is still not found:'
         echo '  export PATH="$HOME/.dotnet:$PATH"'
         export PATH="$HOME/.dotnet:$PATH"

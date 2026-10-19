@@ -88,7 +88,8 @@ elseif (Test-Path -LiteralPath $uninstallSource) {
         Publisher       = 'Yukishiro'
         DisplayIcon     = $exe
         InstallLocation = $target
-        UninstallString = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$uninstaller`" -FromSettings"
+        # PATH に PowerShell のフォルダーが無い PC もあるので、フルパスで書く
+        UninstallString = "`"$(Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\WindowsPowerShell\v1.0\powershell.exe')`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$uninstaller`" -FromSettings"
         URLInfoAbout    = 'https://github.com/yksr-melt/Meltype'
     }
     foreach ($name in $values.Keys) { Set-ItemProperty -Path $key -Name $name -Value $values[$name] }

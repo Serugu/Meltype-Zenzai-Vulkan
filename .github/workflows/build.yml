@@ -11,6 +11,10 @@ on:
       - 'Build-Package.ps1'
       - 'Install-Meltype.ps1'
       - 'packaging/**'
+      - 'Casks/**'
+      - 'docs/**'
+      - '.github/workflows/mac.yml'
+      - '.github/workflows/linux.yml'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
@@ -22,6 +26,10 @@ on:
       - 'Build-Package.ps1'
       - 'Install-Meltype.ps1'
       - 'packaging/**'
+      - 'Casks/**'
+      - 'docs/**'
+      - '.github/workflows/mac.yml'
+      - '.github/workflows/linux.yml'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -175,6 +183,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
@@ -183,52 +193,74 @@ jobs:
         with:
           name: mozc-helper
           path: native/mozc/bin/
-      # コード署名の証明書 (秘密 SIGN_PFX_BASE64 = .pfx を Base64 にしたもの、SIGN_PASSWORD) があれば、Build-Package.ps1 が署名する
-      - name: Signing certificate
+      # 署名の秘密は、署名する step (Sign / Sign installer) にだけ渡す。ビルドしたもの (Meltype.exe --selftest と、
+      # それが起動する Mozc のヘルパー) は、秘密の無い step (Package / Installer / Portable) でだけ実行する。
+      - name: Package
+        shell: powershell
+        # 通常版の app を作って自己診断する。zip は次の Sign で作る。
+        run: .\Build-Package.ps1 -Step Build
+      # コード署名の証明書 (秘密 SIGN_PFX_BASE64 = .pfx を Base64 にしたもの、SIGN_PASSWORD) があれば、Build-Package.ps1 が署名する。
+      # 秘密が無いときは署名せずに zip だけ作る。.pfx は署名したらすぐ消す。
+      # タグ (v1.0.0) なら版番号付き、手動実行なら日時付きの zip を作る。
+      - name: Sign
         shell: powershell
         env:
           SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
-        run: |
-          if ($env:SIGN_PFX_BASE64) {
-            $pfx = Join-Path $env:RUNNER_TEMP 'meltype-sign.pfx'
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
-            "MELTYPE_SIGN_PFX=$pfx" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-      - name: Package
-        shell: powershell
-        env:
           MELTYPE_SIGN_PASSWORD: ${{ secrets.SIGN_PASSWORD }}
-        # タグ (v1.0.0) なら Meltype-1.0.0-windows.zip、手動実行ならテスト版の名前 (Meltype-test-<日時>.zip)
         run: |
           $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '' }
-          .\Build-Package.ps1 -Version $version
+          $pfx = Join-Path $env:RUNNER_TEMP 'meltype-sign.pfx'
+          try {
+            if ($env:SIGN_PFX_BASE64) {
+              [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+              $env:MELTYPE_SIGN_PFX = $pfx
+            }
+            .\Build-Package.ps1 -Version $version -Step Sign
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
       # インストーラー (dist\Meltype-<版>-setup.exe)。zip と同じ app フォルダーから作る (issue #161)。
       - name: Installer
         shell: pwsh
-        env:
-          MELTYPE_SIGN_PASSWORD: ${{ secrets.SIGN_PASSWORD }}
         run: |
           $iscc = .\packaging\Find-InnoSetup.ps1
           $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { 'test-' + (Get-Date -Format 'yyyyMMdd-HHmm') }
           & $iscc /Q "/DAppVersion=$version" "/DSourceDir=$PWD\dist\Meltype" "/DOutputDir=$PWD\dist" packaging\Meltype.iss
           if ($LASTEXITCODE -ne 0) { throw "インストーラーを作れませんでした (exit code $LASTEXITCODE)。" }
+      - name: Sign installer
+        shell: pwsh
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          MELTYPE_SIGN_PASSWORD: ${{ secrets.SIGN_PASSWORD }}
+        run: |
+          if (-not $env:SIGN_PFX_BASE64) { exit 0 }
           $setup = Get-ChildItem -LiteralPath dist -Filter 'Meltype-*-setup.exe' -File | Select-Object -First 1
-          if ($env:MELTYPE_SIGN_PFX -and (Test-Path -LiteralPath $env:MELTYPE_SIGN_PFX)) {
+          $pfx = Join-Path $env:RUNNER_TEMP 'meltype-sign.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
             $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
               Where-Object { $_.FullName -like '*\x64\*' } | Sort-Object FullName | Select-Object -Last 1
-            & $signtool.FullName sign /f $env:MELTYPE_SIGN_PFX /p $env:MELTYPE_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $setup.FullName
+            & $signtool.FullName sign /f $pfx /p $env:MELTYPE_SIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $setup.FullName
             if ($LASTEXITCODE -ne 0) { throw "インストーラーの署名に失敗しました (exit code $LASTEXITCODE)。" }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
+      # ポータブル版の zip。署名した通常版の app を再利用し、自己診断を走らせる (署名の後の、秘密の無い step で作る)。
+      - name: Portable
+        shell: powershell
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '' }
+          .\Build-Package.ps1 -Version $version -Portable -ReuseBuild
       # 検出・検査不能の配布物は、Artifacts にもリリースにも公開しない。
       - name: Scan Windows package with Defender
         shell: powershell
         timeout-minutes: 15
         run: |
           $packages = @(Get-ChildItem -LiteralPath dist -Filter 'Meltype-*.zip' -File)
-          if ($packages.Count -ne 1) { throw 'Expected one Meltype-*.zip file but found ' + $packages.Count }
+          if ($packages.Count -ne 2) { throw 'Expected regular and portable Meltype zip files but found ' + $packages.Count }
           $setups = @(Get-ChildItem -LiteralPath dist -Filter 'Meltype-*-setup.exe' -File)
           if ($setups.Count -ne 1) { throw 'Expected one Meltype-*-setup.exe file but found ' + $setups.Count }
-          .\tools\Scan-WindowsPackage.ps1 -Path @('.\dist\Meltype', $packages[0].FullName, $setups[0].FullName)
+          .\tools\Scan-WindowsPackage.ps1 -Path @('.\dist\Meltype', '.\dist\Meltype-portable', $packages[0].FullName, $packages[1].FullName, $setups[0].FullName)
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: meltype-package

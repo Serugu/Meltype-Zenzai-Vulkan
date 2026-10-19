@@ -19,7 +19,9 @@ internal sealed class ExitSignal : NativeWindow, IDisposable
     public ExitSignal()
     {
         CreateHandle(new CreateParams { Caption = Caption });
-        ChangeWindowMessageFilterEx(Handle, ExitMessage, MSGFLT_ALLOW, IntPtr.Zero);
+        // ふつうの権限からの合図を受け付けるのは、管理者として動いているときだけ。ふつうの権限で動いているときは、
+        // 送り手 (インストーラーなど) からはそのまま届く。広げると、サンドボックス (整合性レベル Low) のプロセスからも終了させられてしまう。
+        if (Input.ForegroundTracker.SelfElevated) ChangeWindowMessageFilterEx(Handle, ExitMessage, MSGFLT_ALLOW, IntPtr.Zero);
     }
 
     protected override void WndProc(ref Message m)

@@ -22,8 +22,7 @@ enable_input_source() {
         echo "入力ソースに Meltype を追加できませんでした。ログアウトしてログインし直すと直ります。" >&2
         return 0
     }
-    killall TextInputMenuAgent 2>/dev/null || true
-    echo "入力ソースに Meltype を追加しました"
+    echo "Meltype の入力ソースの登録処理を実行しました"
 }
 
 # 入力ソースの登録をやり直す (#134)。Meltype.app を入れ替えるとき、バンドルが無い一瞬に入力ソースの

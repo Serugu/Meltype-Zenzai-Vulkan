@@ -1,79 +1,54 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Yukishiro
 
-using System.Collections.Concurrent;
 using Meltype.Config;
 using Meltype.Detection;
 using Meltype.Diagnostics;
 using Meltype.IME;
 using Meltype.Input;
-using Meltype.Learning;
 
 namespace Meltype;
 
 /// <summary>
-/// 各モジュールをつなぐ (設計書 §4)。スレッドは 3 種類:
-///   フックのスレッド   … KeyboardMonitor。InputSession に打鍵を渡すだけ。
-///   再入力ワーカー     … IME 切替と保留分の再入力。待ちが発生する処理はすべてここ (STA)。
-///   タイマー           … 無入力での出力、IME 状態のポーリング、学習データの保存。
+/// 各モジュールをつなぐ (設計書 §4)。
+///   フックのスレッド   … KeyboardMonitor。打鍵を変換ボックス (CompositionService) に渡す (例外: Alt の単独押しの解放の送り直し、MaskAltTap)。
+///   タイマー           … IME 状態のポーリング。
 /// </summary>
-internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
+internal sealed class MeltypeEngine : IDisposable
 {
-    private const int ImeStateFreshMs = 1000;
-
     private readonly string? _configPath;
-    private readonly UserModel _userModel;
     private readonly ScoreEngine _scoreEngine;
-    private readonly InputSession _session;
     private readonly ForegroundTracker _foreground = new();
     private readonly Imm32ImeController _imm32 = new();
-    private readonly TsfImeController _tsf = new();
-    private readonly ImeController _ime;
     private readonly KeyInjector _injector = new();
     private readonly KeyboardMonitor _monitor;
-    private readonly BlockingCollection<FlushRequest> _flushQueue = new();
-    private readonly Thread _worker;
-    private readonly System.Threading.Timer _sessionTimer;
     private readonly System.Threading.Timer _pollTimer;
     // Chrome リモート デスクトップ・Parsec で操作されているか (#372)
     private readonly RemoteControl _remote = new();
-    private readonly System.Threading.Timer _saveTimer;
     private volatile Settings _settings;
     private volatile ImeSnapshot? _imeSnapshot;
-    private string? _lastDenyReason;
     private int _polling;
     private bool _disposed;
 
-    private sealed record ImeSnapshot(IntPtr Window, ImeState State, long Time);
+    private sealed record ImeSnapshot(ImeState State);
 
     public event Action? StatusChanged;
 
     /// <summary>Ctrl + 半角/全角 が押された (フックのスレッドから呼ばれる。受け取った側で UI スレッドに移して切り替える)。</summary>
     public event Action? ToggleRequested;
 
-    /// <summary>判定の強さが「手動」で、IME 自動切替が日本語入力を提案した (ワーカースレッドから呼ばれる)。</summary>
-    public event Action? ImeSuggested;
-
     private readonly HashSet<int> _toggleKeyDown = [];
 
-    public MeltypeEngine(Settings settings, string? configPath, string? modelPath, string? userDictionaryDirectory)
+    public MeltypeEngine(Settings settings, string? configPath, string? userDictionaryDirectory)
     {
         _settings = settings.Clone().Normalize();
         _configPath = configPath;
         Log.SetFileOutput(_settings.FileLog ? AppPaths.LogFile : null);
         Log.RecordText = _settings.LogTypedText;
 
-        _userModel = new UserModel(modelPath);
-        _scoreEngine = ScoreEngine.CreateDefault(_userModel, () => _settings, userDictionaryDirectory);
-        _session = new InputSession(_scoreEngine, () => _settings, this);
-        _ime = new ImeController(_imm32, _tsf, () => _settings);
+        _scoreEngine = ScoreEngine.CreateDefault(() => _settings, userDictionaryDirectory);
         _monitor = new KeyboardMonitor(OnKey, OnMouseButton, OnForegroundChanged, OnFocusChanged);
-        _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "Meltype reinjection" };
-        _worker.SetApartmentState(ApartmentState.STA);
-
-        _sessionTimer = new System.Threading.Timer(_ => SafeRun(() => _session.OnTimer(Environment.TickCount64)), null, Timeout.Infinite, Timeout.Infinite);
         _pollTimer = new System.Threading.Timer(_ => PollImeState(), null, Timeout.Infinite, Timeout.Infinite);
-        _saveTimer = new System.Threading.Timer(_ => SafeRun(_userModel.Save), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public Settings Settings => _settings;
@@ -81,17 +56,10 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
     /// <summary>前面のアプリの独自の種類 (判定の強さ・ライブ変換) を反映した設定。</summary>
     public Settings AppSettings => _settings.ForApp(_foreground.Current.ProcessName);
 
-    public UserModel UserModel => _userModel;
-
-    public DetectionResult? LastDecision => _session.LastDecision;
-
     public void Start()
     {
-        _worker.Start();
         _monitor.Start();
-        _sessionTimer.Change(50, 50);
         _pollTimer.Change(0, 250);
-        _saveTimer.Change(30_000, 30_000);
         Log.Info($"Meltype を開始しました (モード: {_settings.Mode}, 有効: {(_settings.Enabled ? "ON" : "OFF")})。");
     }
 
@@ -117,7 +85,9 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
     /// <summary>UI スレッドで作った変換ボックスをつなぐ。</summary>
     public void AttachComposition(Composition.CompositionService composition)
     {
-        _composition = composition;
+        // 起動の途中から Windows の IME で語を打っている (Enter で確定する前か、確定した直後) なら、閉じずにそのまま打たせる (PollImeState で引き継ぐ)。
+        // 語の途中で Meltype に替わると、前半と後半が別の IME に分かれる。OnKey が _composition を見る前に決めておく
+        Volatile.Write(ref _takeoverPending, IsKeyboardActive && StillTypingInSystemIme() ? 1 : 0);
         composition.PasteCommit = () => PastePolicy.ShouldPaste(_settings, _foreground.Current.ProcessName, IsQt(_foreground.Current.Window));
         composition.InputAllowed = () => KeyboardLayoutPolicy.AllowsInput(_settings);
         composition.Focus.TreatsAsTextInput = () => _settings.TreatsAsTextInput(_foreground.Current.ProcessName)
@@ -136,7 +106,54 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         composition.KeyReplayed += e => TrackLine(e);
         composition.MouseReplayed += () => InvalidateLine();
         composition.Focus.Invalidate();
-        if (IsKeyboardActive) CloseSystemImeAsync();
+        Volatile.Write(ref _composition, composition);
+        if (IsKeyboardActive && !TakeoverPending) CloseSystemImeAsync();
+    }
+
+    /// <summary>起動の途中から Windows の IME で語を打っていて、まだ Meltype キーボードが入力を受け持っていない (1)。</summary>
+    private int _takeoverPending;
+    private bool TakeoverPending => Volatile.Read(ref _takeoverPending) != 0;
+    /// <summary>Meltype キーボードが入力を受け持つ前に、Windows の IME で語を打っている途中か (文字のキーを押してから Enter を押していない)。</summary>
+    private volatile bool _imeMaybeComposing;
+    /// <summary>Meltype キーボードが入力を受け持つ前に、最後にキーを押した時刻。</summary>
+    private long _lastKeyDownMs;
+    /// <summary>最後にキーを押してから、この時間たつまで閉じない (Enter で確定した直後に閉じると、アプリがまだ受け取っていない Enter が改行になる)。</summary>
+    private const int TakeoverQuietMs = 200;
+
+    /// <summary>Windows の IME で語を打っている途中か、打ってすぐか (閉じると、前半と後半が別の IME に分かれる)。</summary>
+    private bool StillTypingInSystemIme() =>
+        _imeMaybeComposing || Environment.TickCount64 - Volatile.Read(ref _lastKeyDownMs) < TakeoverQuietMs;
+
+    /// <summary>
+    /// Meltype キーボードが入力を受け持つ前のキー。Windows の IME で語を打っている途中かを、打ったキーから推す
+    /// (未確定の文字があるかは、ほかのアプリの IME に問い合わせられない)。文字のキーで打ち始め、Enter で確定したとみなす。
+    /// </summary>
+    private void NoteKeyBeforeTakeover(KeyEvent e)
+    {
+        if (!e.IsDown) return;
+        Volatile.Write(ref _lastKeyDownMs, e.TimeMs);
+        if (e.Vk == VirtualKeys.Return) _imeMaybeComposing = false;
+        else if (StartsWordInSystemIme(e)) _imeMaybeComposing = true;
+    }
+
+    /// <summary>Windows の IME が ON なら、変換中の文字を打ち始めるキーか (英字・数字・記号。Ctrl などとの組み合わせは除く)。</summary>
+    private static bool StartsWordInSystemIme(KeyEvent e) =>
+        (VirtualKeys.IsLetter(e.Vk) || IsDigitOrPunctuationKey(e.Vk)) &&
+        !IsDown(VirtualKeys.Control) && !IsDown(VirtualKeys.Menu) && !IsDown(VirtualKeys.LWin) && !IsDown(VirtualKeys.RWin);
+
+    /// <summary>数字・句読点・かぎかっこ・長音・記号のキー (Shift を押して打つ ＃＄％（）＠ なども)。</summary>
+    private static bool IsDigitOrPunctuationKey(int vk) => vk is >= 0x30 and <= 0x39 or >= 0xBA and <= 0xC0 or >= 0xDB and <= 0xDF or 0xE2;
+
+    /// <summary>
+    /// 起動の途中から Windows の IME で打っていたのをやめて、Meltype キーボードが入力を受け持つ。
+    /// 待っていなければ false。Windows の IME を閉じるのは呼び出し元。
+    /// </summary>
+    private bool EndTakeover(string reason)
+    {
+        if (Interlocked.Exchange(ref _takeoverPending, 0) == 0) return false;
+        InvalidateLine();
+        if (IsKeyboardActive) Log.Info($"起動の途中から Windows の IME で打っていたのをやめて、Meltype キーボードが入力を受け持ちます ({reason})。");
+        return true;
     }
 
     /// <summary>終了時。未確定の内容を確定してから切り離す (UI スレッドで呼ぶ)。</summary>
@@ -215,11 +232,9 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             (IsDown(VirtualKeys.Control) || IsDown(VirtualKeys.Shift) || IsDown(VirtualKeys.LWin) || IsDown(VirtualKeys.RWin)));
         if (!KeyboardLayoutPolicy.AllowsInput(settings))
         {
-            SuspendForInputLanguage(e.TimeMs);
+            SuspendForInputLanguage();
             // 既に保留中なら順序を保って送り直す。それ以外の打鍵はそのまま通す。
-            if (settings.Mode == InputMode.Keyboard)
-                return _composition?.Gate.OnKey(e, _ => false) == true;
-            return _session.State == SessionState.Flushing && _session.OnKey(e);
+            return settings.Mode == InputMode.Keyboard && _composition?.Gate.OnKey(e, _ => false) == true;
         }
         // Ctrl + 半角/全角: Meltype 全体の有効/無効 (どちらのモードでも)。変換ボックスの後始末が要るので切り替え自体は UI スレッドで行う。
         if (VirtualKeys.IsHankakuZenkaku(e.Vk) && !e.Injected && e.IsDown && IsDown(VirtualKeys.Control))
@@ -232,21 +247,41 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             return true;
         }
         // Meltype IME (TSF): 入力は IME の側で受け持つので、フックでは何もしない。
-        if (settings.Mode == InputMode.Tsf) return false;
-        if (settings.Mode != InputMode.Keyboard)
+        // 左右の Alt の単独押しだけは、Meltype キーボードと同じく英数 / 日本語の切り替えに使う (Meltype IME が受け持つアプリで。TipServer と同じ判定)。
+        if (settings.Mode == InputMode.Tsf)
         {
-            if (!e.Injected) TrackLine(e);
-            return _session.OnKey(e);
+            var app = _foreground.Current;
+            if (altTap != AltTap.None && settings.Enabled && settings.AltKeysSwitchKeyboard &&
+                settings.IsAppEnabled(app.ProcessName) && !settings.IsGame(app.ProcessName, looksLikeGame: false))
+            {
+                var masked = MaskAltTap(altTap, e);
+                if (altTap == AltTap.Tapped) SetImeOpenAsync(japanese: e.Vk == VirtualKeys.RMenu);
+                return masked;
+            }
+            return false;
         }
         // 変換ボックスの準備前・終了処理中は何もしない (素通し)。
-        if (_composition is not { } composition) return false;
+        // 起動の途中から Windows の IME で語を打っている間も同じ (確定したら PollImeState で引き継ぐ)
+        if (Volatile.Read(ref _composition) is not { } composition || TakeoverPending)
+        {
+            NoteKeyBeforeTakeover(e);
+            return false;
+        }
+        // アプリ別設定で OFF にしたアプリ・ゲーム・全画面のアプリなどでは、切り替えのキーも定型文も扱わず、そのままアプリに通す (Windows の IME で打てるように)。
+        // CloseSystemImeAsync と同じ判定。一時停止中は下で行を追いかけるので、ここでは返さない。
+        // 追いかけない間に打った行は読み直す (同じウィンドウのまま全画面を出たときに、古い行で判定しないように)
+        if (settings.Enabled && !composition.Gate.IsCaptured && !_foreground.Check(settings).Allowed)
+        {
+            _line.Invalidate();
+            return false;
+        }
 
-        // 左 Alt の単独押しで英数、右 Alt の単独押しで日本語。Alt の押下・解放はそのままアプリに通す。
+        // 左 Alt の単独押しで英数、右 Alt の単独押しで日本語。Alt の押下はそのままアプリに通し、解放はメニューバーに移らないよう送り直す (MaskAltTap)。
         if (altTap != AltTap.None && settings.Enabled && settings.AltKeysSwitchKeyboard && !composition.Gate.IsCaptured)
         {
-            // 単独押しでメニューバーに移らないよう、押している間に何もしないキーを送る (Alt + ` と同じ)。
-            if (altTap == AltTap.Pressed) ThreadPool.QueueUserWorkItem(_ => KeyInjector.SendKey(0xE8));
-            else SetKeyboardMode(composition, settings, japanese: e.Vk == VirtualKeys.RMenu);
+            var masked = MaskAltTap(altTap, e);
+            if (altTap == AltTap.Tapped) SetKeyboardMode(composition, settings, japanese: e.Vk == VirtualKeys.RMenu);
+            if (masked) return true;
         }
         // 無変換で英数、変換で日本語 (Mac の 英数 / かな と同じく、トグルではなく決まったモードにする)。
         if (settings.Enabled && settings.ConvertKeysSwitchKeyboard && e.Vk is VirtualKeys.NonConvert or VirtualKeys.Convert && e.IsDown && !e.Injected && !composition.Gate.IsCaptured)
@@ -383,6 +418,45 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         if (IsDown(VirtualKeys.Menu)) ThreadPool.QueueUserWorkItem(_ => KeyInjector.SendKey(0xE8));
     }
 
+    /// <summary>
+    /// 左右の Alt の単独押しでメニューバーに移らないよう、Alt の解放を止めて、何もしないキー (0xE8、割り当てなし) のあとに送り直す。
+    /// まとめて SendInput で送り、次の打鍵より先に届くように、ここだけはフックのスレッドで送る。
+    /// 押している間にスレッドプールで 0xE8 を送るやり方では、すぐに離すと Alt の解放のほうが先に並んでいて、メニューバーに移った。
+    /// 管理者として動くアプリには送り直した Alt の解放が届かず (UIPI)、Alt が押されたままになるので止めない。
+    /// 戻り値: このキー (Alt の解放) を止めたか。
+    /// </summary>
+    private bool MaskAltTap(AltTap altTap, KeyEvent e) =>
+        altTap == AltTap.Tapped && ForegroundTracker.CanSendInputTo(_foreground.Current) && _injector.Inject(MaskedAltRelease(e));
+
+    /// <summary>Alt の単独押しの解放 release の代わりに送るキー (0xE8 の押下・解放のあとに、release をそのまま。右 Alt の拡張キーの印も残す)。</summary>
+    internal static KeyEvent[] MaskedAltRelease(KeyEvent release) =>
+        [new KeyEvent(0xE8, 0, false, false, false, 0), new KeyEvent(0xE8, 0, false, true, false, 0), release];
+
+    /// <summary>
+    /// Meltype IME のモードで、前面のアプリの IME を日本語入力 / 英数にする (左右の Alt の単独押し)。
+    /// Meltype IME は開閉の変化を受けて表示を切り替え、英数にするときは変換中の文字を確定する。
+    /// 「コード」のアプリのコードの行だけを日本語にする働き (半角/全角 と同じ) はない。フックのスレッドでは待たない。
+    /// </summary>
+    private void SetImeOpenAsync(bool japanese)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                // 日本語のキーボードでなければ IME は無い
+                if (ImeTarget.FromForeground() is not { } target || (Native.GetKeyboardLayout(target.ThreadId).ToInt64() & 0xFFFF) != 0x0411) return;
+                if (_imm32.TrySetOpen(target, japanese, null, _settings.ImeTimeoutMs))
+                    Log.Info(japanese ? "左右の Alt: 日本語入力にしました (右 Alt)" : "左右の Alt: 英数にしました (左 Alt)");
+                else
+                    Log.Warn($"左右の Alt: {(japanese ? "日本語入力" : "英数")}にできませんでした。");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"左右の Alt: IME を切り替えられませんでした: {ex.Message}");
+            }
+        });
+    }
+
     // ---- アプリの種類「コード」: コメント・文字列の中だけ日本語 ----
 
     private readonly LineTracker _line = new();
@@ -415,7 +489,9 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             return true;
         }
         // 入力欄にフォーカスがないとき (エクスプローラーのファイル一覧など) は展開しない。名前を消す Backspace が「前のフォルダーに戻る」になってしまう。
-        if (e.Vk is not (VirtualKeys.Space or VirtualKeys.Tab) || IsDown(VirtualKeys.Shift) || !SnippetsEnabled(settings) || !composition.Focus.CanCapture) return false;
+        // Meltype の設定画面などでも展開しない。プロファイルの名前などの画面を閉じて戻った直後は、フォーカスの判定が閉じた画面の入力欄のまま残っている。
+        if (e.Vk is not (VirtualKeys.Space or VirtualKeys.Tab) || IsDown(VirtualKeys.Shift) || !SnippetsEnabled(settings) || !composition.Focus.CanCapture ||
+            ForegroundTracker.IsOwnWindow(Native.GetForegroundWindow())) return false;
         _snippet.Mark = settings.SnippetMark;
         if (_snippet.Expand(composition.Snippets) is not { } expansion) return false;
         lock (_swallowedToggleUps) _swallowedToggleUps.Add(e.Vk);
@@ -600,7 +676,7 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         var reconvert = e.Vk == VirtualKeys.Convert;
         // 句読点・かぎかっこ・長音・数字・記号のキー (Shift を押して打つ ＃＄％（）＠ なども) でも変換ボックスを開く。
         // 日本語の中では全角、英語の中では半角になる。
-        var punctuation = e.Vk is >= 0x30 and <= 0x39 or >= 0xBA and <= 0xC0 or >= 0xDB and <= 0xDF or 0xE2;
+        var punctuation = IsDigitOrPunctuationKey(e.Vk);
         // かな入力 (JIS): かなのキー (数字・記号のキーも含む) はすべて入力を始める。
         if (settings.InputStyle == InputStyle.Kana && !_keyboardDirect && KanaDetector.IsKanaKey(e.Vk)) punctuation = true;
         // 日本語入力のときの Shift+Space は全角スペース (Microsoft IME と同じ: issue #24)。
@@ -633,7 +709,8 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         if (!_foreground.Check(settings).Allowed) return false;
         // 文字入力欄 (パスワード以外) にフォーカスがあるときだけ。ショートカットキーやゲームの操作を横取りしない。
         if (_composition?.Focus.CanCaptureWaiting() != true &&
-            !(RechecksStaleFocus(_foreground.Current.ProcessName) && _composition?.Focus.RecheckStale() == true)) return false;
+            !(RechecksStaleFocus(_foreground.Current.ProcessName) && _composition?.Focus.RecheckStale() == true) &&
+            !RecheckAfterClick()) return false;
         // コードエディター・ターミナル: コードの中は英数のまま通す (補完もそのまま効く)。コメント・文字列の中は日本語を判定する。
         if (!reconvert && !_keyboardDirect && IsCodeApp(settings))
         {
@@ -646,14 +723,11 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         return true;
     }
 
-    /// <summary>英数状態で打ち始めた英字がローマ字 (日本語) かを、IME 自動切替と同じ判定器で調べる。UI スレッドから呼ばれる。</summary>
+    /// <summary>英数状態で打ち始めた英字がローマ字 (日本語) かを調べる。UI スレッドから呼ばれる。</summary>
     public Verdict ClassifyDirect(string letters, bool final)
     {
-        var settings = AppSettings.Clone();
-        // かな入力なら打鍵をかな配列として、それ以外はローマ字として判定する。
-        settings.InputStyle = settings.InputStyle == InputStyle.Kana ? InputStyle.Kana : InputStyle.Romaji;
         var keys = letters.Select(c => (int)char.ToUpperInvariant(c)).ToArray();
-        var result = _scoreEngine.Evaluate(new DetectionInput(letters, keys, final), settings);
+        var result = _scoreEngine.Evaluate(new DetectionInput(letters, keys, final), AppSettings);
         // 同梱の辞書にない英単語 (debate, potato) はローマ字としても読めるので、スペルチェッカーの語なら日本語にしない。
         if (result.Verdict == Verdict.Japanese && letters.Length >= 4 && Detection.WindowsSpellChecker.Shared.IsWord(letters.ToLowerInvariant()))
         {
@@ -671,6 +745,18 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         else _directEnglishWord = true;
     }
 
+    /// <summary>
+    /// クリックの直後に、入力欄ではない所で打ち始めた: クリックで移るはずのフォーカスが、まだ前の場所のまま調べ終わっていることがある
+    /// (入力欄をクリックしてすぐ打つと、最初の文字が変換ボックスを通らずに消えていた)。今のフォーカスを調べ直させて、最大 100 ms 待つ。
+    /// </summary>
+    private bool RecheckAfterClick()
+    {
+        if (_composition is not { } composition) return false;
+        var capture = composition.Focus.RecheckAfterClick(out var waited);
+        if (waited >= 0) Log.Info($"クリック直後の打ち始め: フォーカスを調べ直した ({waited} ms) → {(capture ? "入力欄なので変換ボックスに入れる" : "入力欄ではない")}");
+        return capture;
+    }
+
     private bool OnMouseButton(Composition.MouseButtonEvent e)
     {
         if (IsButtonDown(e.Message)) _altTap.Cancel();
@@ -680,17 +766,14 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             if (composition.Gate.OnMouseButton(e)) return true;
             if (IsButtonDown(e.Message))
             {
+                composition.Focus.NoteClick();
                 composition.Focus.Invalidate();
                 composition.ResetContext();
                 InvalidateLine();
             }
             return false;
         }
-        if (IsButtonDown(e.Message))
-        {
-            _session.OnContextChanged(Environment.TickCount64);
-            InvalidateLine();
-        }
+        if (IsButtonDown(e.Message)) InvalidateLine();
         return false;
     }
 
@@ -735,10 +818,13 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         }
         _settings = next;
         if (!next.Enabled || next.Mode != InputMode.Keyboard || !KeyboardLayoutPolicy.AllowsInput(next)) _composition?.Flush();
-        if (next.Mode == InputMode.Keyboard && (previous.Mode != InputMode.Keyboard || !previous.Enabled)) CloseSystemImeAsync();
+        if (next.Mode == InputMode.Keyboard && (previous.Mode != InputMode.Keyboard || !previous.Enabled))
+        {
+            EndTakeover("動作モードか有効・無効を変えた");
+            CloseSystemImeAsync();
+        }
         // Meltype IME のモードにしたら (トレイでも設定画面でも)、いま使う入力方式も Meltype IME にする (Win + Space で選び直さなくてよいように)
         if (SwitchesToTsf(previous.Mode, next.Mode)) Tip.TipServer.ActivateForSession();
-        if (!next.Enabled) FlushAbandoned(_session.Abort());
         // 「入力欄とみなすアプリ」を変えたら、今のフォーカスを調べ直す (前面のアプリに戻ったときを待たずに効かせる)。
         if (previous.TextInputApps != next.TextInputApps) _composition?.Focus.Invalidate();
         Log.SetFileOutput(next.FileLog ? AppPaths.LogFile : null);
@@ -758,113 +844,10 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
     public DetectionResult Evaluate(string letters, Settings? settings = null) =>
         _scoreEngine.Evaluate(new DetectionInput(letters, letters.Select(c => (int)char.ToUpperInvariant(c)).ToArray(), IsFinal: false), settings ?? _settings);
 
-    // ---- ISessionEnvironment (InputSession のロック内から呼ばれる。重い処理はしない) ----
-
-    bool ISessionEnvironment.IsModifierDown() =>
-        IsDown(VirtualKeys.Control) || IsDown(VirtualKeys.Menu) || IsDown(VirtualKeys.LWin) || IsDown(VirtualKeys.RWin) || IsDown(VirtualKeys.Shift);
-
-    CollectPermission ISessionEnvironment.CanCollect()
-    {
-        if (!KeyboardLayoutPolicy.AllowsInput(_settings)) return CollectPermission.Deny("入力言語が日本語ではない");
-        var permission = _foreground.Check(_settings);
-        // コードエディター・ターミナルのコードの中 (コメント・文字列の外) では判定しない。
-        if (permission.Allowed && InCode(_settings)) permission = CollectPermission.Deny("コードの中 (コメント・文字列の外)");
-        if (permission.Allowed)
-        {
-            // 既に日本語入力になっているなら保留する意味がない (遅延を出さない)。
-            var snapshot = _imeSnapshot;
-            if (snapshot is not null && snapshot.Window == _foreground.Current.Window &&
-                Environment.TickCount64 - snapshot.Time < ImeStateFreshMs && snapshot.State.IsJapaneseReady)
-            {
-                permission = CollectPermission.Deny("既に日本語入力");
-            }
-        }
-        if (!permission.Allowed && permission.Reason != _lastDenyReason && permission.Reason != "既に日本語入力")
-        {
-            Log.Info($"保留しません: {permission.Reason}");
-        }
-        _lastDenyReason = permission.Reason;
-        return permission;
-    }
-
-    void ISessionEnvironment.RequestFlush(FlushRequest request)
-    {
-        Log.Decision(request.Result.Describe());
-        if (!_flushQueue.IsAddingCompleted) _flushQueue.Add(request);
-    }
-
-    void ISessionEnvironment.SessionEnded(SessionSummary summary)
-    {
-        if (summary.UserCorrected)
-        {
-            Log.Decision($"誤判定のフィードバック: {Log.Text(summary.Letters)} は {summary.Verdict} ではなかった → {summary.Outcome}");
-        }
-        if (_settings.LearningEnabled)
-        {
-            _userModel.Learn(summary.Letters, summary.Outcome, summary.Verdict == Verdict.English);
-        }
-    }
-
-    // ---- 再入力ワーカー ----
-
-    private void WorkerLoop()
-    {
-        foreach (var request in _flushQueue.GetConsumingEnumerable())
-        {
-            try
-            {
-                if (!KeyboardLayoutPolicy.AllowsInput(_settings)) continue;
-                if (request.Result.Verdict == Verdict.Japanese && _settings.DetectionLevel == DetectionLevel.Manual)
-                {
-                    // 手動: 切り替えずに提案だけ出す。
-                    Log.Decision($"日本語入力の提案 (手動のため切り替えない): {request.Result.Describe()}");
-                    ImeSuggested?.Invoke();
-                }
-                else if (request.Result.Verdict == Verdict.Japanese)
-                {
-                    var target = ImeTarget.FromForeground();
-                    var result = _ime.EnsureJapanese(target);
-                    var message = $"IME 切替: {result.Outcome} ({result.Before} → {result.After}) {result.Detail}";
-                    if (result.Success) Log.Decision(message);
-                    else Log.Warn(message + " — 保留分は切り替えずにそのまま出力します。");
-                    if (target is not null) _imeSnapshot = new ImeSnapshot(target.TopLevel, result.After, Environment.TickCount64);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Error($"IME 切替で例外: {ex.Message}");
-            }
-            finally
-            {
-                // 何があっても保留分は必ず出力する (入力を失わない)。
-                Drain();
-            }
-            StatusChanged?.Invoke();
-        }
-    }
-
-    private void Drain()
-    {
-        try
-        {
-            while (_session.TakePendingForFlush() is { } events) _injector.Inject(events);
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"再入力で例外: {ex.Message}");
-        }
-    }
-
-    private void FlushAbandoned(List<KeyEvent> events)
-    {
-        if (events.Count > 0) _injector.Inject(events);
-    }
-
     // ---- フック・タイマーからの通知 ----
 
-    private void SuspendForInputLanguage(long now)
+    private void SuspendForInputLanguage()
     {
-        _session.OnContextChanged(now);
         _directEnglishWord = false;
         _codeJapanese = false;
         _line.Invalidate();
@@ -885,17 +868,21 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         _composition?.Focus.Invalidate();
         _directEnglishWord = false;
         _composition?.ResetContext();
-        _session.OnContextChanged(Environment.TickCount64);
     }
 
     private void OnForegroundChanged(IntPtr window)
     {
         // 変換中に別のウィンドウに切り替わったら、変換中の内容は捨てる (切り替わった先のアプリに入らないように)。
         _composition?.Abandon("別のウィンドウに切り替わった");
+        // 起動の途中から Windows の IME で打っていた語も、ここで終わる (Meltype キーボードを使うなら下で閉じる)
+        _imeMaybeComposing = false;
+        EndTakeover("別のウィンドウに切り替わった");
         _foreground.Refresh(window);
         InvalidateLine();
         _sigil.Start();
         _snippet.Start();
+        // 置き換えた直後の Esc で戻すのは、置き換えたウィンドウの中だけ
+        _lastSnippet = null;
         _lastLineKind = null;
         var app = _foreground.Current;
         if (_settings.ProfileFor(app.ProcessName) == AppProfile.Code)
@@ -905,7 +892,6 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
         _composition?.Focus.InvalidateForeground();
         _directEnglishWord = false;
         _composition?.ResetContext();
-        _session.OnContextChanged(Environment.TickCount64);
         // 独自の種類で「最初は英数」にしたアプリに切り替えたら英数から始める。
         if (_settings is { Enabled: true, Mode: InputMode.Keyboard } && !_keyboardDirect && _settings.KindFor(app.ProcessName) is { StartInEnglish: true } kind)
         {
@@ -934,11 +920,19 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             if (!KeyboardLayoutPolicy.AllowsInput(_settings, target))
             {
                 _imeSnapshot = null;
-                SuspendForInputLanguage(Environment.TickCount64);
+                SuspendForInputLanguage();
                 return;
             }
             var state = _imm32.GetState(target);
-            _imeSnapshot = new ImeSnapshot(target.TopLevel, state, Environment.TickCount64);
+            _imeSnapshot = new ImeSnapshot(state);
+            if (TakeoverPending)
+            {
+                // 起動の途中から Windows の IME で語を打っている間は閉じない。IME が OFF と分かれば、変換中の文字は無い (分からないときは待つ)
+                var closed = state.Mode == IME.ImeMode.Closed;
+                if (!closed && StillTypingInSystemIme()) return;
+                if (EndTakeover(closed ? "IME が OFF" : "Enter で確定した") && IsKeyboardActive) CloseSystemImeAsync();
+                return;
+            }
             if (_settings.Mode == InputMode.Keyboard) KeepSystemImeClosed(target, state);
         }
         catch (Exception ex)
@@ -974,9 +968,11 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
             _lastLayout = layout;
         }
         if (state.Mode != IME.ImeMode.Open) return;
-        var composition = _composition;
-        // 変換ボックスで入力中は、確定の直前に閉じる (CompositionService) ので触らない。
-        if (composition is null || composition.Gate.IsCaptured) return;
+        // アプリ別設定で OFF にしたアプリ (・ゲーム) では、Microsoft IME をそのまま使ってもらう (CloseSystemImeAsync と同じ)
+        if (!_foreground.Check(_settings).Allowed) return;
+        var composition = Volatile.Read(ref _composition);
+        // 変換ボックスで入力中は、確定の直前に閉じる (CompositionService) ので触らない。起動の途中から Windows の IME で打っている間も触らない
+        if (composition is null || composition.Gate.IsCaptured || TakeoverPending) return;
         var now = Environment.TickCount64;
         // ユーザーが IME を ON にし続ける (閉じてもすぐ開く) なら、10 秒に 3 回までにして奪い合わない。
         if (now - _lastForcedClose > 10000) _forcedCloses = 0;
@@ -990,34 +986,16 @@ internal sealed class MeltypeEngine : ISessionEnvironment, IDisposable
 
     public ImeState? CurrentImeState => _imeSnapshot?.State;
 
-    public void ResetLearning()
-    {
-        _userModel.Reset();
-        Log.Info("学習データをリセットしました。");
-    }
-
     private static bool IsDown(int vk) => (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
-
-    private static void SafeRun(Action action)
-    {
-        try { action(); }
-        catch (Exception ex) { Log.Error(ex.Message); }
-    }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _monitor.Dispose();
-        _sessionTimer.Dispose();
         _pollTimer.Dispose();
         _remote.Dispose();
         _lineTimer?.Dispose();
-        _saveTimer.Dispose();
-        _flushQueue.CompleteAdding();
-        if (_worker.IsAlive) _worker.Join(3000); // Start 前 (起動に失敗したとき) でも Dispose できるように
-        FlushAbandoned(_session.Abort());
-        _userModel.Save();
         Log.Info("Meltype を終了しました。");
         Log.FlushFile();
     }

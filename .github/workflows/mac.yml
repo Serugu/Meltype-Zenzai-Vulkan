@@ -31,8 +31,11 @@ jobs:
     # タグ時の softprops/action-gh-release 用。permissions は式が使えないため常に write。
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
@@ -97,6 +100,63 @@ jobs:
           name: meltype-mac
           path: dist/Meltype-*.zip
           retention-days: 14
+      # Homebrew の cask をこのリリースの zip の SHA-256 で作る (#863)。同じリポジトリを tap として使い、Casks/ に更新する。
+      - name: Homebrew cask
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          node tools/make-manifests.mjs "${GITHUB_REF_NAME#v}" "dist/Meltype-${GITHUB_REF_NAME#v}-mac.zip"
+          cat dist/manifests/homebrew/Casks/meltype.rb
+            # GitHub App のトークンなら、作成した PR の CI も起動する (bot.yml / sponsors.yml と同じ)。
+      - id: app-token
+        if: startsWith(github.ref, 'refs/tags/v') && vars.BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      # main は PR 必須のため、リリースごとに更新 PR を作る。
+      - name: Create Homebrew cask update PR
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          cask='dist/manifests/homebrew/Casks/meltype.rb'
+          version="${GITHUB_REF_NAME#v}"
+          branch="homebrew-cask-${version}"
+          current_version="$(gh api "repos/$GITHUB_REPOSITORY/contents/Casks/meltype.rb" --jq '.content | @base64d' | sed -n 's/^  version "\([^"]*\)"$/\1/p')"
+          if [[ "$current_version" == "$version" ]]; then
+            echo "Homebrew cask is already at $version."
+            exit 0
+          fi
+
+          branch_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha 2>/dev/null || true)"
+          if [[ -z "$branch_sha" ]]; then
+            main_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/heads/$branch" -f sha="$main_sha"
+          fi
+
+          content="$(base64 < "$cask" | tr -d '\n')"
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/contents/Casks/meltype.rb?ref=$branch" --jq .sha)"
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/Casks/meltype.rb" \
+            -f message="Update Homebrew cask to $version" \
+            -f branch="$branch" -f content="$content" -f sha="$sha"
+
+          existing_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$GITHUB_REPOSITORY_OWNER:$branch" --base main --state open \
+            --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing_pr" ]]; then
+            echo "Updated Homebrew cask PR #$existing_pr."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+              --title "Update Homebrew cask to $version" \
+              --body "Updates the Homebrew cask and SHA-256 for the $version release."
+          fi
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: homebrew-cask
+          path: dist/manifests/homebrew/Casks/meltype.rb
+          retention-days: 90
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@e598afbe1493e6b1bafb1f389cabb956eab91231 # v3.0.3
         with:

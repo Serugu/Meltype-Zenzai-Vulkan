@@ -76,6 +76,14 @@ bool IsHankakuZenkaku(UINT vk) { return vk == VK_KANJI || vk == 0xF3 || vk == 0x
 
 bool KeyDown(int vk) { return (GetKeyState(vk) & 0x8000) != 0; }
 
+// このスレッドでメニューを開いている (Win+X のメニュー・右クリックのメニュー・メニューバーなど: issue #862)。
+// メニューの間に打つキーはメニューのアクセスキー (Win+X の U など) なので、入力欄の IME として受け取らない
+bool InMenuMode() {
+    GUITHREADINFO info = {sizeof(info)};
+    return GetGUIThreadInfo(GetCurrentThreadId(), &info) &&
+           (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE)) != 0;
+}
+
 // US 配列の Alt + ` (半角/全角キー相当)。Alt はキーイベントの lParam も確認する。
 bool IsAltGraveToggle(UINT vk, LPARAM lParam) {
     const ULONG_PTR message = static_cast<ULONG_PTR>(lParam);
@@ -149,6 +157,19 @@ std::wstring ProcessName() {
     std::wstring result = name ? name + 1 : path;
     if (result.size() > 4 && _wcsicmp(result.c_str() + result.size() - 4, L".exe") == 0) result.resize(result.size() - 4);
     return result;
+}
+
+// Chromium 系のブラウザーか。本物のパスワード欄では、Chromium は IME を無効にした入力欄 (空の文書) に切り替える (ContextDisabled で分かる)。
+// 一方で、ふつうの入力欄 (Twitch のコメント欄・U-NEXT の検索欄など) を、アプリが知らせる入力欄の種類でパスワードと言ってくることがある (issue #878)
+bool IsChromiumBrowser() {
+    static const bool chromium = [] {
+        std::wstring name = ProcessName();
+        for (const wchar_t* browser : {L"chrome", L"msedge", L"brave", L"vivaldi", L"opera", L"chromium"}) {
+            if (_wcsicmp(name.c_str(), browser) == 0) return true;
+        }
+        return false;
+    }();
+    return chromium;
 }
 
 }  // namespace
@@ -399,12 +420,13 @@ STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* focus, ITfDocumentMgr*) {
     ForgetSecretField();
     if (candidates_) candidates_->Hide();
     AdviseTextEditSink(focus);
-    if (!disabled_) Hello();
     return S_OK;
 }
 
 STDMETHODIMP TextService::OnSetFocus(BOOL foreground) {
     if (!foreground && candidates_) candidates_->Hide();
+    // 別アプリの設定画面から戻ったとき、キー入力の前に最新設定を読み直す。
+    if (foreground && !disabled_) Hello();
     // キーを受け取らなくなった (スレッドが前面でなくなった・ほかの IME に移った): 受け取ったキーを離したことは届かないかもしれないので忘れる
     // (このスレッドで次に押したキーの、離したことまで受け取らないように)
     if (!foreground) {
@@ -459,8 +481,11 @@ bool TextService::IsSecretField(TfEditCookie ec, ITfContext* context) {
     if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection, &fetched)) || fetched == 0) return false;
     const wchar_t* failed = nullptr;
     bool secret = false;
+    bool appSaysSecret = false;
+    std::wstring secretScopes;  // 調べるとき用: パスワードとみなした入力欄の種類 (数値)
     for (ITfReadOnlyProperty* property : {static_cast<ITfReadOnlyProperty*>(windowsProperty.Get()), appProperty.Get()}) {
         if (property == nullptr) continue;
+        bool fromApp = property == appProperty.Get();
         VARIANT value;
         VariantInit(&value);
         if (FAILED(property->GetValue(ec, selection.range, &value))) {
@@ -475,7 +500,11 @@ bool TextService::IsSecretField(TfEditCookie ec, ITfContext* context) {
                 failed = L"GetInputScopes";
             } else {
                 for (UINT i = 0; i < count; i++) {
-                    if (IsSecretScope(scopes[i])) secret = true;
+                    if (IsSecretScope(scopes[i])) {
+                        if (fromApp) appSaysSecret = true;
+                        else secret = true;
+                        secretScopes += (secretScopes.empty() ? L"" : L", ") + std::wstring(fromApp ? L"アプリ " : L"Windows ") + std::to_wstring(static_cast<int>(scopes[i]));
+                    }
                     if (scopes[i] == IS_PRIVATE) privateField_ = true;
                 }
             }
@@ -488,6 +517,16 @@ bool TextService::IsSecretField(TfEditCookie ec, ITfContext* context) {
     }
     selection.range->Release();
     if (failed != nullptr) return unreadable(failed);
+    if (appSaysSecret) {
+        // Chromium 系のブラウザーで、アプリだけがパスワードと言い、IME も無効にしていない入力欄は、パスワード欄とみなさない (issue #878)
+        if (IsChromiumBrowser() && !secret && !ContextDisabled(context)) {
+            if (lastSecretScopes_ != secretScopes) TipLog(L"アプリがパスワード欄と知らせてきましたが、IME を無効にしていないので入力欄として扱います (%s)", secretScopes.c_str());
+        } else {
+            secret = true;
+        }
+    }
+    if (secret && lastSecretScopes_ != secretScopes) TipLog(L"パスワードの入力欄の種類: %s", secretScopes.c_str());
+    lastSecretScopes_ = secretScopes;
     return secret;
 }
 
@@ -639,6 +678,7 @@ void TextService::Hello() {
     JsonValue reply;
     serverActive_ = Request("{\"op\":\"hello\",\"process\":" + JsonString(ProcessName()) + "}", reply) && reply[L"active"].Bool();
     directDetection_ = serverActive_ && reply[L"directDetection"].Bool();
+    fullWidthSpace_ = serverActive_ && reply[L"fullWidthSpace"].Bool();
     directEnglishWord_ = false;
     // コードエディター・ターミナルのアプリなら、キャレットが動くたびに入力モードの表示を合わせる (QueryMode)
     codeApp_ = serverActive_ && reply[L"code"].Bool();
@@ -717,6 +757,7 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
     };
     // 設定が変わった場合も、英数状態での次の打鍵時に検知の有効/無効を更新する。
     if (!open_ && !directDetection_) return pass(L"英数");
+    if (InMenuMode()) return pass(L"メニューを開いている");
     if (KeyDown(VK_CONTROL) || KeyDown(VK_MENU) || KeyDown(VK_LWIN) || KeyDown(VK_RWIN)) return pass(L"Ctrl・Alt・Windows キーを押している");
     if (ContextDisabled(context)) return pass(L"この入力欄では使わない");
     ch = CharOf(vk, 0);
@@ -727,8 +768,9 @@ bool TextService::WouldEat(ITfContext* context, UINT vk, LPARAM lParam, wchar_t&
         directEnglishWord_ = false;
     }
     // Shift+Space は全角スペース (Microsoft IME と同じ。Meltype.exe が入れる: issue #246)
+    // 設定「スペースを全角で入力」が ON なら、日本語入力のときの Space も受け取る (Space が全角・Shift+Space が半角。Meltype.exe が入れる: issue #881)
     bool starts = (ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') || (ch >= L'!' && ch <= L'~') ||
-                  (vk == VK_SPACE && KeyDown(VK_SHIFT));
+                  (vk == VK_SPACE && (KeyDown(VK_SHIFT) || (open_ && fullWidthSpace_)));
     if (!starts) return false;
     if (!ServerReady()) return pass(L"Meltype.exe が使えない");
     // パスワード欄か。OnTestKeyDown で読んだ結果は、続く同じキー・同じ入力欄の OnKeyDown で 1 回だけ使う (ほかのキー・入力欄には使わない)
@@ -884,6 +926,8 @@ void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch) {
             // (送り直すと、その間に打った次のキーより後に届いて順番が入れ替わる)
             keyFailed_ = true;
             serverActive_ = false;
+            // 次のキーで、すぐに問い合わせ直す (Meltype.exe の画面のスレッドが少しふさがっただけなら、次のキーから使える)
+            lastHello_ = 0;
             if (candidates_) candidates_->Hide();
             EndComposition(ec);
             // Ctrl・Alt・Windows キーとの組み合わせは、文字を入れずにアプリに送り直す
@@ -900,6 +944,7 @@ void TextService::HandleKey(ITfContext* context, UINT vk, wchar_t ch) {
         serverActive_ = reply[L"active"].Bool();
         directDetection_ = serverActive_ && reply[L"directDetection"].Bool();
         directEnglishWord_ = directDetection_ && reply[L"directEnglishWord"].Bool();
+        fullWidthSpace_ = serverActive_ && reply[L"fullWidthSpace"].Bool();
         switchToJapanese = reply[L"switchToJapanese"].Bool();
         consumed_ = reply[L"consumed"].Bool();
         ApplyMode(reply);

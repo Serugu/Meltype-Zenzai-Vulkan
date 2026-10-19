@@ -2,11 +2,15 @@
 # Copyright (C) 2026 Yukishiro
 
 # -Version を付けると、公開するリリースの名前 (dist\Meltype-<版>-windows.zip) にする (GitHub Actions がタグから付ける)。
-param([string]$Version = '')
+# -Portable を付けると、アプリ内にデータを保存するポータブル版 zip を作る。
+# -ReuseBuild を -Portable と一緒に付けると、直前に作った通常版の app を再利用する (CI 用)。
+# -Step Build は通常版の app を作って自己診断するところまで、-Step Sign はその app に署名して zip を作るところだけを行う (CI 用)。
+# 署名の秘密 (MELTYPE_SIGN_PFX / MELTYPE_SIGN_PASSWORD) がある間に、ビルドしたもの (Meltype.exe・Mozc のヘルパー) を実行しないため。
+param([string]$Version = '', [switch]$Portable, [switch]$ReuseBuild, [ValidateSet('All', 'Build', 'Sign')][string]$Step = 'All')
 
 $ErrorActionPreference = 'Stop'
 
-# 協力者に渡すテスト版の zip を作る: dist\Meltype-test-<日付>.zip
+# 協力者に渡すテスト版の zip を作る: dist\Meltype-test-<日付>-windows.zip
 # 中身は ビルド済みの app フォルダー (.NET ランタイム同梱) + Install.cmd / Uninstall.cmd + README.txt。
 #
 # .NET の同梱: この環境は NuGet が使えないので自己完結ビルド (--self-contained) の代わりに、
@@ -15,20 +19,80 @@ $ErrorActionPreference = 'Stop'
 
 $root = $PSScriptRoot
 $dist = Join-Path $root 'dist'
-$stage = Join-Path $dist 'Meltype'
+$packageName = if ($Portable) { 'Meltype-portable' } else { 'Meltype' }
+$stage = Join-Path $dist $packageName
 $app = Join-Path $stage 'app'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
-$zip = if ($Version) { Join-Path $dist "Meltype-$Version-windows.zip" } else { Join-Path $dist "Meltype-test-$stamp.zip" }
+$zip = if ($Version) {
+    if ($Portable) { Join-Path $dist "Meltype-$Version-windows-portable.zip" }
+    else { Join-Path $dist "Meltype-$Version-windows.zip" }
+}
+elseif ($Portable) { Join-Path $dist "Meltype-test-$stamp-windows-portable.zip" }
+else { Join-Path $dist "Meltype-test-$stamp-windows.zip" }
 
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
+if ($Portable -and $Step -ne 'All') { throw '-Step は通常版だけで使えます。' }
+if ($Step -ne 'Sign') {
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+}
 
+$mozcBin = Join-Path $root 'native\mozc\bin'
+$dotnetRoot = Split-Path -Parent (Get-Command dotnet).Source
+$runtime = Join-Path $app 'dotnet'
+$version = $null
+$signtool = $null
+
+# 同梱したランタイムで自己診断を走らせる。通常版・ポータブル版の両方の最終配置で使う。
+function Invoke-SelfTest([string]$label, [string]$executable) {
+    $report = Join-Path $dist 'selftest.txt'
+    if (Test-Path -LiteralPath $report) { Remove-Item -LiteralPath $report }
+    $env:DOTNET_DISABLE_GUI_ERRORS = '1'
+    try {
+        $process = Start-Process -FilePath $executable -ArgumentList '--selftest', "`"$report`"" -PassThru
+        if (-not $process.WaitForExit(120000)) { $process.Kill(); throw "自己診断 ($label) が終わりませんでした。" }
+    } finally {
+        Remove-Item Env:\DOTNET_DISABLE_GUI_ERRORS -ErrorAction SilentlyContinue
+    }
+    $lines = if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding UTF8 } else { @() }
+    Write-Host "--- 自己診断 ($label) ---"
+    $lines | Where-Object { $_ -notlike 'LOADED:*' } | Write-Host
+    if ($process.ExitCode -ne 0) { throw "自己診断 ($label) に失敗しました (exit code $($process.ExitCode))。ランタイムを削りすぎている可能性があります。" }
+    $loaded = $lines | Where-Object { $_ -like 'LOADED:*' } | Select-Object -First 1
+    return @(($loaded -replace '^LOADED:\s*', '') -split ' ' | Where-Object { $_ })
+}
+
+if ($Portable -and $ReuseBuild) {
+    $baseApp = Join-Path $dist 'Meltype\app'
+    if (-not (Test-Path -LiteralPath (Join-Path $baseApp 'Meltype.exe'))) {
+        throw '再利用できる通常版のビルドがありません。先に Build-Package.ps1 を実行してください。'
+    }
+    New-Item -ItemType Directory -Force -Path $app | Out-Null
+    Copy-Item -Path (Join-Path $baseApp '*') -Destination $app -Recurse -Force
+    $runtime = Join-Path $app 'dotnet'
+    $installedRuntime = Get-ChildItem (Join-Path $runtime 'shared\Microsoft.NETCore.App') -Directory |
+        Sort-Object { [version]$_.Name } | Select-Object -Last 1
+    if (-not $installedRuntime) { throw '通常版のビルドに同梱された .NET ランタイムが見つかりません。' }
+    $version = $installedRuntime.Name
+    # ポータブル版は Meltype キーボード固定。IME 登録・更新スクリプトは持たせない。
+    Remove-Item -LiteralPath (Join-Path $app 'tip') -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $app 'meltype-ime.ps1'), (Join-Path $app 'update.ps1') -Force -ErrorAction SilentlyContinue
+    Write-Host '通常版のビルド済みアプリを再利用し、ポータブル版を作ります。'
+}
+else {
+if ($Step -eq 'Sign') {
+    # -Step Build で作った app をそのまま使う。ここでは何も実行しない。
+    if (-not (Test-Path -LiteralPath (Join-Path $app 'Meltype.exe'))) {
+        throw '署名する通常版のビルドがありません。先に Build-Package.ps1 -Step Build を実行してください。'
+    }
+    $version = (Get-ChildItem (Join-Path $runtime 'shared\Microsoft.NETCore.App') -Directory | Sort-Object { [version]$_.Name } | Select-Object -Last 1).Name
+    $imeBuilt = Test-Path -LiteralPath (Join-Path $app 'tip')
+}
+else {
 dotnet publish (Join-Path $root 'src\Meltype\Meltype.csproj') -c Release -o $app -p:DebugType=none `
     -p:AppHostDotNetSearch=AppRelative -p:AppHostRelativeDotNet=dotnet
 if ($LASTEXITCODE -ne 0) { throw "ビルドに失敗しました (exit code $LASTEXITCODE)。" }
 
 # Mozc の変換ヘルパー (native\mozc\Build-MozcHelper.ps1 で作ったもの) を同梱する。無ければ Microsoft IME だけで動く。
-$mozcBin = Join-Path $root 'native\mozc\bin'
 if (Test-Path -LiteralPath (Join-Path $mozcBin 'meltype_mozc_helper.exe')) {
     # ヘルパーが使う Visual C++ のランタイム (MSVCP140.dll など) は、Build-MozcHelper.ps1 がビルドに使った Visual Studio から bin に置いている。
     # 前の版の Build-MozcHelper.ps1 で作った bin には無い。版がずれないよう、ほかから補わずに止める
@@ -51,7 +115,6 @@ else {
 # Meltype が使うランタイムの版 (runtimeconfig.json に書かれている) と同じものを、インストール済みの .NET から探してコピーする。
 $config = Get-Content -Raw (Join-Path $app 'Meltype.runtimeconfig.json') | ConvertFrom-Json
 $frameworks = @($config.runtimeOptions.frameworks) + @($config.runtimeOptions.framework) | Where-Object { $_ }
-$dotnetRoot = Split-Path -Parent (Get-Command dotnet).Source
 $runtime = Join-Path $app 'dotnet'
 $version = $null
 foreach ($framework in $frameworks) {
@@ -96,26 +159,6 @@ function Update-DepsJson {
     }
 }
 
-# 同梱したランタイムで自己診断を走らせ、読み込まれたアセンブリ名の一覧を返す。
-# (起動できないときに Windows のエラー画面で止まらないよう DOTNET_DISABLE_GUI_ERRORS を付け、時間も区切る)
-function Invoke-SelfTest([string]$label) {
-    $report = Join-Path $dist 'selftest.txt'
-    if (Test-Path -LiteralPath $report) { Remove-Item -LiteralPath $report }
-    $env:DOTNET_DISABLE_GUI_ERRORS = '1'
-    try {
-        $process = Start-Process -FilePath (Join-Path $app 'Meltype.exe') -ArgumentList '--selftest', "`"$report`"" -PassThru
-        if (-not $process.WaitForExit(120000)) { $process.Kill(); throw "自己診断 ($label) が終わりませんでした。" }
-    } finally {
-        Remove-Item Env:\DOTNET_DISABLE_GUI_ERRORS -ErrorAction SilentlyContinue
-    }
-    $lines = if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Encoding UTF8 } else { @() }
-    Write-Host "--- 自己診断 ($label) ---"
-    $lines | Where-Object { $_ -notlike 'LOADED:*' } | Write-Host
-    if ($process.ExitCode -ne 0) { throw "自己診断 ($label) に失敗しました (exit code $($process.ExitCode))。ランタイムを削りすぎている可能性があります。" }
-    $loaded = $lines | Where-Object { $_ -like 'LOADED:*' } | Select-Object -First 1
-    return @(($loaded -replace '^LOADED:\s*', '') -split ' ' | Where-Object { $_ })
-}
-
 function Test-Managed([string]$path) {
     try { [System.Reflection.AssemblyName]::GetAssemblyName($path) | Out-Null; return $true } catch { return $false }
 }
@@ -137,7 +180,7 @@ foreach ($file in Get-ChildItem (Join-Path $runtime 'shared') -Recurse -File) {
     }
 }
 Update-DepsJson
-$loaded = Invoke-SelfTest '参照をたどって削った後'
+$loaded = Invoke-SelfTest '参照をたどって削った後' (Join-Path $app 'Meltype.exe')
 
 # 2. 読み込まれなかった大きなアセンブリを削る
 foreach ($file in Get-ChildItem (Join-Path $runtime 'shared') -Recurse -Filter '*.dll') {
@@ -150,24 +193,31 @@ foreach ($file in Get-ChildItem (Join-Path $runtime 'shared') -Recurse -Filter '
     }
 }
 Update-DepsJson
-Invoke-SelfTest '読み込まれない部品も削った後' | Out-Null
+Invoke-SelfTest '読み込まれない部品も削った後' (Join-Path $app 'Meltype.exe') | Out-Null
 
-# Meltype IME (入力欄に直接入力する TSF の DLL)。x64 と x86 (32bit のアプリ用) をビルドして同梱する。
-# C++ のビルドツールが無ければ、Meltype IME を入れずに作る (変換ボックスの方式だけの zip になる)
+# Meltype IME (入力欄に直接入力する TSF の DLL)。ポータブル版は登録を行わないので含めない。
 $tip = Join-Path $app 'tip'
-$imeBuilt = $true
-try { & (Join-Path $root 'native\tip\build.ps1') -Configuration Release }
-catch {
-    $imeBuilt = $false
-    Write-Warning "Meltype IME をビルドできないので、入れずに作ります: $($_.Exception.Message)"
-}
-if ($imeBuilt) {
-    foreach ($arch in 'x64', 'x86') {
-        New-Item -ItemType Directory -Force -Path (Join-Path $tip $arch) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $root "native\tip\bin\$arch\MeltypeTip.dll"), (Join-Path $root "native\tip\bin\$arch\MeltypeTip.dll.sha256") -Destination (Join-Path $tip $arch)
+$imeBuilt = $false
+if (-not $Portable) {
+    $imeBuilt = $true
+    try { & (Join-Path $root 'native\tip\build.ps1') -Configuration Release }
+    catch {
+        $imeBuilt = $false
+        Write-Warning "Meltype IME をビルドできないので、入れずに作ります: $($_.Exception.Message)"
     }
-    Copy-Item -LiteralPath (Join-Path $root 'native\tip\Register-Tip.ps1') -Destination $tip
-    Copy-Item -LiteralPath (Join-Path $root 'packaging\meltype-ime.ps1') -Destination $app
+    if ($imeBuilt) {
+        foreach ($arch in 'x64', 'x86') {
+            New-Item -ItemType Directory -Force -Path (Join-Path $tip $arch) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "native\tip\bin\$arch\MeltypeTip.dll"), (Join-Path $root "native\tip\bin\$arch\MeltypeTip.dll.sha256") -Destination (Join-Path $tip $arch)
+        }
+        Copy-Item -LiteralPath (Join-Path $root 'native\tip\Register-Tip.ps1') -Destination $tip
+        Copy-Item -LiteralPath (Join-Path $root 'packaging\meltype-ime.ps1') -Destination $app
+    }
+}
+}
+if ($Step -eq 'Build') {
+    Write-Host "通常版の app を作りました: $app (署名と zip は -Step Sign で行います)"
+    return
 }
 
 # コード署名 (証明書があるときだけ): 環境変数 MELTYPE_SIGN_PFX (証明書の .pfx) と MELTYPE_SIGN_PASSWORD を設定すると、
@@ -195,16 +245,40 @@ foreach ($arch in @(if ($imeBuilt) { 'x64', 'x86' })) {
     try { $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($dll))).Replace('-', '') } finally { $sha.Dispose() }
     [IO.File]::WriteAllText("$dll.package.sha256", $hash)
 }
+}
 
-# 自動更新の確認に使う (Meltype が app フォルダーから呼ぶ)
-Copy-Item -LiteralPath (Join-Path $root 'packaging\update.ps1') -Destination $app
-foreach ($file in 'Install.cmd', 'Uninstall.cmd', 'install.ps1', 'uninstall.ps1', 'README.txt') {
-    Copy-Item -LiteralPath (Join-Path $root "packaging\$file") -Destination $stage
+if ($Portable) {
+    [IO.File]::WriteAllText((Join-Path $app 'Meltype.portable'), 'portable', [Text.Encoding]::ASCII)
+    # ZIP 内で Meltype.exe を見つけやすくし、ランタイムや辞書を含むフォルダーごと持ち運べるようにする。
+    Copy-Item -Path (Join-Path $app '*') -Destination $stage -Recurse -Force
+    Remove-Item -LiteralPath $app -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $root 'packaging\README-portable.txt') -Destination (Join-Path $stage 'README.txt')
+    if (Test-Path -LiteralPath (Join-Path $mozcBin 'meltype_mozc_helper.exe')) {
+        Copy-Item -LiteralPath (Join-Path $mozcBin 'MOZC-LICENSE.txt') -Destination $stage
+        Copy-Item -LiteralPath (Join-Path $mozcBin 'MOZC-CREDITS.html') -Destination $stage
+        Copy-Item -LiteralPath (Join-Path $mozcBin 'VC-RUNTIME.txt') -Destination $stage
+    }
+    Copy-Item -LiteralPath (Join-Path $dotnetRoot 'LICENSE.txt') -Destination (Join-Path $stage 'DOTNET-LICENSE.txt')
+    Copy-Item -LiteralPath (Join-Path $dotnetRoot 'ThirdPartyNotices.txt') -Destination (Join-Path $stage 'DOTNET-THIRD-PARTY-NOTICES.txt')
+}
+else {
+    # 自動更新とインストール用スクリプトは通常版だけに含める。
+    Copy-Item -LiteralPath (Join-Path $root 'packaging\update.ps1') -Destination $app
+    foreach ($file in 'Install.cmd', 'Uninstall.cmd', 'install.ps1', 'uninstall.ps1', 'README.txt') {
+        Copy-Item -LiteralPath (Join-Path $root "packaging\$file") -Destination $stage
+    }
 }
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
 
+if ($Portable) {
+    # 配布時と同じ配置 (exe とマーカーが同じフォルダー) で起動し、data の保存先を含めて確認する。
+    Invoke-SelfTest 'ポータブル版の最終配置' (Join-Path $stage 'Meltype.exe') | Out-Null
+    # 自己診断が作ったデータは配布物に含めない。
+    Remove-Item -LiteralPath (Join-Path $stage 'data') -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Remove-Item -LiteralPath (Join-Path $dist 'selftest.txt') -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
 $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-Write-Host "テスト版を作成しました: $zip ($size MB, .NET $version 同梱)"
+Write-Host "パッケージを作成しました: $zip ($size MB, .NET $version 同梱)"

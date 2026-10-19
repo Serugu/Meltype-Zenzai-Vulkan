@@ -11,7 +11,20 @@ if CommandLine.arguments.contains("--version") {
 }
 
 if CommandLine.arguments.contains("--register-input-source") {
-    exit(InputSourceRegistration.register() == 0 ? 0 : 1)
+    let outcome = InputSourceRegistration.register()
+    guard outcome == .ready else { exit(outcome.exitCode) }
+    let refresh = Process()
+    refresh.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+    refresh.arguments = ["TextInputMenuAgent"]
+    refresh.standardOutput = FileHandle.nullDevice
+    refresh.standardError = FileHandle.nullDevice
+    do {
+        try refresh.run()
+        refresh.waitUntilExit()
+    } catch {
+        FileHandle.standardError.write(Data("入力メニューの表示を更新できませんでした: \(error.localizedDescription)\n".utf8))
+    }
+    exit(0)
 }
 
 // Input Method Kit のサーバーを起動する。入力欄 (クライアント) ごとに MeltypeInputController が作られる。
@@ -28,6 +41,14 @@ if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contai
         print("\(condition ? "PASS" : "FAIL") \(name)")
         if !condition { failures += 1 }
     }
+    check("reconversion: replaces matching previous text",
+          matchesExpectedText("って", expected: "って", deleteBefore: 2))
+    check("reconversion: preserves changed pasted text",
+          !matchesExpectedText("paste", expected: "って", deleteBefore: 2))
+    check("reconversion: counts UTF-16 units",
+          matchesExpectedText("😊", expected: "😊", deleteBefore: 2))
+    check("reconversion: rejects missing expected text",
+          !matchesExpectedText("って", expected: nil, deleteBefore: 2))
     func type(_ text: String, session: UnsafeMutableRawPointer?, before: String? = nil) -> (String, SessionResult?) {
         var output = ""
         var last: SessionResult?
@@ -45,7 +66,12 @@ if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contai
             for edit in last?.commits ?? [] {
                 if edit.deleteBefore > 0 {
                     let current = output as NSString
-                    output = current.substring(to: max(0, current.length - edit.deleteBefore))
+                    // 消す文字を確認できないときは、前の文字は消さずに edit.text だけを入れる (本体の状態とそろえる)。
+                    if edit.deleteBefore <= current.length,
+                       matchesExpectedText(current.substring(from: current.length - edit.deleteBefore),
+                                           expected: edit.expect, deleteBefore: edit.deleteBefore) {
+                        output = current.substring(to: current.length - edit.deleteBefore)
+                    }
                 }
                 output += edit.text
             }
@@ -102,10 +128,27 @@ if CommandLine.arguments.contains("--self-test") || CommandLine.arguments.contai
     print("issue 114: first checks=\(checksAfterFirst - checksBefore), repeat checks=\(repeatedChecks), elapsed=\(Date().timeIntervalSince(started))s")
     check("issue 114: repeated spelling uses cache", repeatedChecks == 0 && firstOutput == secondOutput)
     let other: [String: Any] = ["InputSourceKind": "Keyboard Layout", "KeyboardLayout Name": "ABC"]
-    let duplicate: [String: Any] = ["Bundle ID": InputSourceRegistration.identifier, "InputSourceKind": "Keyboard Input Method"]
-    let repaired = InputSourceRegistration.normalized([other] + Array(repeating: duplicate, count: 15))
-    check("issue 101: deduplicate input sources", repaired.count == 3 && (repaired[0]["KeyboardLayout Name"] as? String) == "ABC")
-    check("issue 101: registration is idempotent", NSArray(array: repaired).isEqual(to: InputSourceRegistration.normalized(repaired)))
+    let duplicate: [String: Any] = ["Bundle ID": InputSourceRegistration.identifier, "InputSourceKind": "Keyboard Input Method", "metadata": ["keep": true]]
+    let duplicateMode: [String: Any] = ["Bundle ID": InputSourceRegistration.identifier,
+                                      "Input Mode": InputSourceRegistration.japaneseIdentifier, "InputSourceKind": "Input Mode"]
+    let duplicatePairs = (0..<15).flatMap { _ in [duplicate, duplicateMode] }
+    let repaired = InputSourceRegistration.repaired(legacy: [other] + duplicatePairs, thirdParty: duplicatePairs)
+    check("issue 101: deduplicate each existing store without moving entries",
+          NSArray(array: repaired.legacy).isEqual(to: [other, duplicate, duplicateMode]) &&
+          NSArray(array: repaired.thirdParty ?? []).isEqual(to: [duplicate, duplicateMode]))
+    let repeatedRepair = InputSourceRegistration.repaired(legacy: repaired.legacy, thirdParty: repaired.thirdParty)
+    check("issue 101: repair is idempotent", NSArray(array: repeatedRepair.legacy).isEqual(to: repaired.legacy) &&
+          NSArray(array: repeatedRepair.thirdParty ?? []).isEqual(to: repaired.thirdParty ?? []))
+    let fallback = InputSourceRegistration.repaired(legacy: [duplicateMode, other, duplicate], thirdParty: nil)
+    check("issue 101: preserve order, metadata and absent store", fallback.thirdParty == nil &&
+          NSArray(array: fallback.legacy).isEqual(to: [duplicateMode, other, duplicate]))
+    let malformedPreferences: [Any] = ["not an array", [other, "not a dictionary"] as [Any]]
+    for invalid in malformedPreferences {
+        do {
+            _ = try InputSourceRegistration.validatedSources(invalid, name: "self-test")
+            check("issue 101: reject malformed preferences", false)
+        } catch { check("issue 101: reject malformed preferences", true) }
+    }
     do {
         for format in [PropertyListSerialization.PropertyListFormat.xml, .binary] {
             let data = try PropertyListSerialization.data(fromPropertyList: [["shortcut": "カイシャ", "phrase": "株式会社テスト"]], format: format, options: 0)

@@ -100,7 +100,7 @@ VS Code やターミナルでは英数が基本で、コメントと文字列の
 |---|---|
 | Windows (zip) | `Meltype-<version>-windows.zip` を展開して `Install.cmd` をダブルクリック |
 | Mac (プレビュー版) | `Meltype-<version>-mac.zip` ([mac/README.md](mac/README.md)) |
-| Linux (プレビュー版) | `Meltype-<version>-linux.zip` (IBus / fcitx5、[linux/README.md](linux/README.md)) |
+| Linux (プレビュー版) | `Meltype-<version>-linux.zip` (ARM64 は `Meltype-<version>-linux-arm64.zip`。IBus / fcitx5、[linux/README.md](linux/README.md)) |
 
 インストーラーでも zip でも、入る場所は同じ `%LOCALAPPDATA%\Programs\Meltype` です。
 Windows 版に必要なのは Windows 10 / 11 (64bit) と Microsoft IME だけで、.NET は同梱しています。
@@ -254,6 +254,10 @@ General Public License for more details.
       <a href="https://github.com/MuNeNiCK"><img src="https://github.com/MuNeNiCK.png?size=200" width="100" alt="@MuNeNiCK"><br><b>@MuNeNiCK</b></a><br>
       <sub>Meltype IME の登録 (インストーラー)</sub>
     </td>
+    <td align="center">
+      <a href="https://github.com/konayukiw"><img src="https://github.com/konayukiw.png?size=200" width="100" alt="@konayukiw"><br><b>@konayukiw</b></a><br>
+      <sub>メインメンテナー</sub>
+    </td>
   </tr>
 </table>
 
@@ -276,7 +280,7 @@ General Public License for more details.
   <a href="https://github.com/01mercurylampe"><img src="https://github.com/01mercurylampe.png?size=120" width="60" alt="@01mercurylampe" title="@01mercurylampe"></a>
 </p>
 <!-- sponsors:end -->
-<sub>名前を公開にして応援してくださった方を、毎日自動で載せています (.github/workflows/sponsors.yml)。</sub>
+<sub>名前を公開にして応援してくださった方を載せています。</sub>
 
 <a name="テスト版で協力してくださった方々"></a>
 <img src="docs/images/headings/readme/s05.svg" alt="テスト版で協力してくださった方々" height="40">

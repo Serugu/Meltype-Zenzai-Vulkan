@@ -25,6 +25,9 @@ internal sealed class CorrectionReportDialog : Form
     public CorrectionReportDialog(CorrectionLog log, Config.Settings settings)
     {
         Text = "Meltype 直した誤判定を報告";
+        // 期待した結果などを日本語で打てるようにする。打ったものの欄はキーをそのまま書くので英数のまま。
+        // 最後に押したキーは選ぶだけの欄だが、入力欄と判定して「あ」の表示を出し、開いた一覧が閉じていた
+        Input.ForegroundTracker.AllowTyping(this, _typed, _key);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Yu Gothic UI", 9.5F);
         Size = new Size(640, 520);
@@ -58,9 +61,11 @@ internal sealed class CorrectionReportDialog : Form
 
         var open = new Button { Text = "GitHub で報告", AutoSize = true };
         var copy = new Button { Text = "コピー", AutoSize = true };
-        var close = new Button { Text = "閉じる", AutoSize = true, DialogResult = DialogResult.Cancel };
+        var close = new Button { Text = "閉じる", AutoSize = true };
         open.Click += (_, _) => Open();
         copy.Click += (_, _) => Copy();
+        // Show() で開く (モードレス) ので、DialogResult では閉じない (issue #864)
+        close.Click += (_, _) => Close();
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(6) };
         buttons.Controls.AddRange([close, open, copy, _status]);
 

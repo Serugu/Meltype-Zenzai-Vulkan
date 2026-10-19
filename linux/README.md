@@ -37,7 +37,7 @@ Windows 版と同じく、日本語を打っている途中の英単語は英字
 <a name="動く環境"></a>
 <img src="../docs/images/headings/linux/01.svg" alt="動く環境" height="53"><br>
 
-- Ubuntu 24.04 など (x86_64)
+- Ubuntu 24.04 など (x86_64 / ARM64)
 - 入力の仕組みが IBus (GNOME、Ubuntu の標準) か fcitx5 (KDE など) のもの
 
 fcitx5 のアドオンは、Ubuntu 24.04 の fcitx5 5.1 で作っています。版が大きく違う fcitx5 では動かないことがあります。
@@ -47,11 +47,48 @@ fcitx5 のアドオンは、Ubuntu 24.04 の fcitx5 5.1 で作っています。
 <a name="インストール"></a>
 <img src="../docs/images/headings/linux/02.svg" alt="インストール" height="53"><br>
 
-1. [Releases](https://github.com/yksr-melt/Meltype/releases/latest) から `Meltype-<version>-linux.zip` をダウンロードして展開する
+1. [Releases](https://github.com/yksr-melt/Meltype/releases/latest) から `Meltype-<version>-linux.zip` (ARM64 のパソコンは `Meltype-<version>-linux-arm64.zip`) をダウンロードして展開する
 2. 「端末」(ターミナル) を開いて、展開したフォルダーで次を実行する (管理者のパスワードを聞かれます。足りない部品があれば自動で入れます)
    ```bash
    bash install.sh
    ```
+
+Debian / Ubuntu では、`.deb` からも入れられます (apt で外せます。中身は `install.sh` で入れるものと同じです)。
+[Releases](https://github.com/yksr-melt/Meltype/releases/latest) から CPU に合う `.deb` をダウンロードして、次のコマンドでインストールします。
+
+x86_64:
+
+```bash
+sudo apt install ./meltype_<version>_amd64.deb
+```
+
+ARM64:
+
+```bash
+sudo apt install ./meltype_<version>_arm64.deb
+```
+
+`.deb` は IBus と fcitx5 の両方に入れます (IBus の部品は「おすすめ」なので、ふつうは一緒に入ります)。
+
+apt リポジトリから入れると、以後 `sudo apt update && sudo apt upgrade` で更新できます。初回だけ、公開鍵とリポジトリを登録します。
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://yksr-melt.github.io/Meltype/apt/meltype-archive-key.asc | sudo tee /etc/apt/keyrings/meltype-archive-key.asc >/dev/null
+sudo chmod 0644 /etc/apt/keyrings/meltype-archive-key.asc
+sudo tee /etc/apt/sources.list.d/meltype.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://yksr-melt.github.io/Meltype/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/meltype-archive-key.asc
+EOF
+sudo apt update
+sudo apt install meltype
+```
+
+apt リポジトリがまだ公開されていない場合は、上の Releases から `.deb` を入れる方法を使ってください.
 
 <a name="ibus-のとき"></a>
 <img src="../docs/images/headings/linux/s01.svg" alt="IBus のとき" height="40">
@@ -114,6 +151,8 @@ bash uninstall.sh
 # 設定と学習データも消すなら
 bash uninstall.sh --data
 ```
+
+`.deb` で入れたときは `sudo apt remove meltype` で外します (設定と学習データ `~/.local/share/Meltype` は残るので、要らなければ消してください)。
 
 <br>
 

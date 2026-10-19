@@ -129,6 +129,7 @@ internal static class TestRunner
         if (args.FirstOrDefault() == "--gen-emoji") { EmojiGenerator.Run(args[1], args[2], args[3]); return 0; }
         if (args.FirstOrDefault() == "--eval") { Quality.Print(Quality.Run()); return 0; }
         if (args.FirstOrDefault() == "--tip-server") return TipHarness.Server(int.TryParse(args.ElementAtOrDefault(1), out var seconds) ? seconds : 600);
+        if (args.FirstOrDefault() == "--focus-e2e") return FocusEndToEnd.Run();
         if (args.FirstOrDefault() == "--tip-e2e")
         {
             TipEndToEnd.ShotDirectory = args.ElementAtOrDefault(1);
@@ -139,7 +140,7 @@ internal static class TestRunner
         {
             // 調査用: 設定画面とユーザー辞書の画面を表示せずに画像にする。
             Application.EnableVisualStyles();
-            var engine = new MeltypeEngine(new Config.Settings(), null, null, null);
+            var engine = new MeltypeEngine(new Config.Settings(), null, null);
             using var invoker = new Control();
             invoker.CreateControl();
             using var service = new Composition.CompositionService(invoker, Composition.CompositionDetector.CreateDefault(), new Composition.CompositionOptions { UserDictionary = new Composition.UserDictionary(null) });

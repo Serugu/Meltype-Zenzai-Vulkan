@@ -57,6 +57,13 @@ Meltype はアプリではなく「入力ソース」(日本語入力) です。
 
 起動エラーが出たときは、入力メニューから ABC または標準の日本語入力を選んでください。初回に入力ソースが見つからないときだけ、ログアウト・ログインしてから入力メニューを確かめてください。
 
+Homebrew から入れる場合は、最初に tap を追加してからインストールします。以後は `brew upgrade --cask meltype` で更新できます。
+
+```bash
+brew tap yksr-melt/Meltype https://github.com/yksr-melt/Meltype.git
+brew install --cask yksr-melt/Meltype/meltype
+```
+
 <a name="ソースからビルドする"></a>
 <img src="../docs/images/headings/mac/s01.svg" alt="ソースからビルドする" height="40">
 
@@ -167,13 +174,13 @@ Mac 版には登録の画面がないので、データフォルダ (`~/Library/
   ```bash
   ~/Library/Input\ Methods/Meltype.app/Contents/MacOS/MeltypeRegisterInputSource
   ```
-  これで戻らなければ、ログアウトしてログインし直す。`~/Library/Input Methods/Meltype.app` があるか確かめる。「+」の一覧に出ないときは、ターミナルで次を実行してから入力メニューを見る (`install.sh` も同じことをします、#21)
+  これで戻らなければ、ログアウトしてログインし直す。`~/Library/Input Methods/Meltype.app` があるか確かめる。
+- **Meltype がいくつも並ぶ**: ターミナルで次を実行する
   ```bash
-  defaults write com.apple.HIToolbox AppleEnabledInputSources -array-add \
-    '<dict><key>Bundle ID</key><string>io.github.yksr-melt.inputmethod.Meltype</string><key>InputSourceKind</key><string>Keyboard Input Method</string></dict>' \
-    '<dict><key>Bundle ID</key><string>io.github.yksr-melt.inputmethod.Meltype</string><key>Input Mode</key><string>io.github.yksr-melt.inputmethod.Meltype.Japanese</string><key>InputSourceKind</key><string>Input Mode</string></dict>'
-  killall TextInputMenuAgent
+  "$HOME/Library/Input Methods/Meltype.app/Contents/MacOS/Meltype" --register-input-source
   ```
+  OS の登録 API で登録・有効化した後、`com.apple.HIToolbox` の `AppleEnabledInputSources` と `com.apple.inputsources` の `AppleEnabledThirdPartyInputSources` を読み、Meltype がある各一覧の中で親と日本語モードの重複を除く。最初の項目の位置と付随情報、ほかの入力ソースを保持する。OS の版番号で保存先を作ったり、一方の一覧から他方へ移したりはしない。両方に Meltype がある場合も、それぞれの登録を残す。
+  変更前の一覧は、変更する設定領域の `MeltypeInputSourcesBeforeRepair` に保存する。有効な日本語モードが一件になるまで最大約 2 秒待つ。反映待ちの場合は件数と対処方法を表示して終了コード 0 で終了し、入力メニューを再起動しない。設定の形式・保存・登録 API の失敗は終了コード 1 にする。表示が戻らなければ、設定画面で追加し直すかログアウトしてログインし直す。保存先をまたぐ登録の統合は行わないため、このコマンドだけで実メニューが必ず一件になるとは限らない。
 - **入力メニューに「絵文字と記号を表示」「キーボードビューアを表示」「キーボード設定を開く…」の 3 つしか出ない**: 入力ソースの登録は残っていて Meltype も使えるが、メニューの一覧が古いまま固まっている (#134)。上の `MeltypeRegisterInputSource` を実行すると直る。応急処置は、入力メニューで「キーボードビューアを表示」を押すか、ターミナルで `killall TextInputMenuAgent` (macOS がすぐ起動し直します)。入力メニューの一覧は、選択できるキーボード系の入力ソースが 2 つ以上あるときだけ出るので、1 つしか無いときも同じ見え方になります
 - **動きがおかしい**: ログを見る
   ```bash

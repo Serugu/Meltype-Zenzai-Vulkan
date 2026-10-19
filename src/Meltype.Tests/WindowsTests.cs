@@ -53,6 +53,37 @@ internal static class WindowsTests
     }
 
     [Test]
+    public static void AllowTyping_FollowsRecreatedHandles()
+    {
+        // ハンドルを作り直したら (ShowInTaskbar などを変えたとき) 新しいハンドルに替え、閉じたら外す。外すときに新しいハンドルを作らない。表示はしない
+        var before = (ForegroundTracker.TypingAllowedWindows.Count, ForegroundTracker.DirectInputControls.Count);
+        var form = new RecreatableForm();
+        var name = new RecreatableTextBox();
+        form.Controls.Add(name);
+        ForegroundTracker.AllowTyping(form, name);
+        var (oldForm, oldName) = (form.Handle, name.Handle);
+        Assert.True(ForegroundTracker.TypingAllowedWindows.ContainsKey(oldForm), "窓を登録");
+        Assert.True(ForegroundTracker.DirectInputControls.ContainsKey(oldName), "欄を登録");
+        form.Recreate();
+        name.Recreate();
+        Assert.True(form.Handle != oldForm && name.Handle != oldName, "作り直すとハンドルが変わる");
+        Assert.True(!ForegroundTracker.TypingAllowedWindows.ContainsKey(oldForm) && ForegroundTracker.TypingAllowedWindows.ContainsKey(form.Handle), "窓は新しいハンドルだけ");
+        Assert.True(!ForegroundTracker.DirectInputControls.ContainsKey(oldName) && ForegroundTracker.DirectInputControls.ContainsKey(name.Handle), "欄は新しいハンドルだけ");
+        form.Dispose();
+        Assert.True((ForegroundTracker.TypingAllowedWindows.Count, ForegroundTracker.DirectInputControls.Count) == before, "閉じたら何も残らない");
+    }
+
+    private sealed class RecreatableForm : Form
+    {
+        public void Recreate() => RecreateHandle();
+    }
+
+    private sealed class RecreatableTextBox : TextBox
+    {
+        public void Recreate() => RecreateHandle();
+    }
+
+    [Test]
     public static void MsIme_LongReading_IsSplitBeforeTheEngineLimit()
     {
         // #221: Microsoft IME の変換エンジンは 100 文字を超える読みを受け付けない (E_LARGEINPUT)。区切って渡す
@@ -117,10 +148,46 @@ internal static class WindowsTests
     {
         // トレイでも設定画面でも、動作モードを Meltype IME に変えたら入力方式も Meltype IME にする。
         Assert.True(MeltypeEngine.SwitchesToTsf(InputMode.Keyboard, InputMode.Tsf), "Meltype キーボードから");
-        Assert.True(MeltypeEngine.SwitchesToTsf(InputMode.AutoSwitch, InputMode.Tsf), "IME 自動切替から");
         Assert.True(!MeltypeEngine.SwitchesToTsf(InputMode.Tsf, InputMode.Tsf), "ほかの設定だけ変えたときは切り替えない");
         Assert.True(!MeltypeEngine.SwitchesToTsf(InputMode.Keyboard, InputMode.Keyboard), "Meltype IME を使えずに元のモードに戻したときは切り替えない");
         Assert.True(!MeltypeEngine.SwitchesToTsf(InputMode.Tsf, InputMode.Keyboard), "Meltype IME から外したときは切り替えない");
+    }
+
+    [Test]
+    public static void AltTap_ReleaseIsSentAfterMaskKey()
+    {
+        // 右 Alt (拡張キー) の単独押しの解放: 0xE8 の押下・解放のあとに、解放をそのまま送り直す (先に解放が届くとメニューバーに移る)
+        var release = new KeyEvent(VirtualKeys.RMenu, 0x38, Extended: true, IsUp: true, Injected: false, TimeMs: 0);
+        var events = MeltypeEngine.MaskedAltRelease(release);
+        Assert.Equal(3, events.Length);
+        Assert.True(events[0] is { Vk: 0xE8, IsUp: false } && events[1] is { Vk: 0xE8, IsUp: true }, "先に 0xE8 を押して離す");
+        Assert.True(events[2] is { Vk: VirtualKeys.RMenu, Scan: 0x38, Extended: true, IsUp: true }, "解放は右 Alt の拡張キーのまま");
+    }
+
+    [Test]
+    public static void FirstLetter_AfterClickAndAutofill()
+    {
+        // クリックの直後 (1 秒以内) の打ち始めだけ、フォーカスを調べ直す
+        Assert.True(Composition.FocusInspector.IsRightAfterClick(1500, 1000), "クリックの 0.5 秒後");
+        Assert.True(!Composition.FocusInspector.IsRightAfterClick(2500, 1000), "クリックの 1.5 秒後は調べ直さない");
+        Assert.True(!Composition.FocusInspector.IsRightAfterClick(1500, 0), "クリックしていない (1 回使った後) は調べ直さない");
+
+        // Chrome・Edge・Vivaldi のフォームの自動入力の候補の行は、入力欄として扱う
+        Assert.True(Composition.FocusInspector.IsSuggestionRow("PopupRowContentView"), "自動入力の候補");
+        Assert.True(Composition.FocusInspector.IsSuggestionRow("OmniLinkItem"), "Vivaldi のアドレスバーの候補");
+        Assert.True(!Composition.FocusInspector.IsSuggestionRow("PopupView"), "候補の行ではない");
+
+        // 候補を閉じた直後の、種類も名前も無い要素: 同じウィンドウで直前 (2 秒以内) が候補の行なら、入力欄として扱う
+        var row = new Composition.FocusInfo(true, false, null, "候補", "35000", "PopupRowContentView");
+        Assert.True(Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", row, sameForeground: true, sincePreviousMs: 660), "候補の行の 0.7 秒後");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", row, sameForeground: true, sincePreviousMs: 2500), "候補の行から 2 秒より後");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", row, sameForeground: false, sincePreviousMs: 100), "別のウィンドウ");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", new Composition.FocusInfo(true, false, null, "Edit", "", "Edit"), sameForeground: true, sincePreviousMs: 100), "直前がふつうの入力欄 (候補を閉じた直後ではない)");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", new Composition.FocusInfo(true, false, null, "直前の入力欄のまま"), sameForeground: true, sincePreviousMs: 100), "直前がこの判定で入力欄にした要素 (引き継ぎは続かない)");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "", new Composition.FocusInfo(true, true, null, "候補", "", "PopupRowContentView"), sameForeground: true, sincePreviousMs: 100), "直前がパスワード");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(50000, "", "", row, sameForeground: true, sincePreviousMs: 100), "ボタン (種類のある要素)");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "メニュー", "", row, sameForeground: true, sincePreviousMs: 100), "名前のある要素");
+        Assert.True(!Composition.FocusInspector.KeepsPreviousTextInput(0, "", "Chrome_WidgetWin_1", row, sameForeground: true, sincePreviousMs: 100), "クラス名のある要素");
     }
 
     [Test]
@@ -176,6 +243,21 @@ internal static class WindowsTests
         Assert.True(!global::Meltype.Program.ShouldFallBackToKeyboard(introduced, knownUnregistered: false, inUserLanguageList: false, x64), "使っていた人は、一覧に無くても戻さない");
         Assert.True(global::Meltype.Program.ShouldFallBackToKeyboard(introduced, knownUnregistered: false, inUserLanguageList: true, arm64), "使っていた人も、ARM64 なら戻す");
         Assert.True(!global::Meltype.Program.ShouldFallBackToKeyboard(new Settings { Mode = InputMode.Keyboard }, knownUnregistered: true, inUserLanguageList: false, arm64), "Meltype キーボードはそのまま");
+    }
+
+    [Test]
+    public static void Portable_UsesDataFolderBesideExecutable()
+    {
+        Assert.Equal(Path.Combine(@"C:\Apps\Meltype", "data"), AppPaths.ResolveDataDirectory(true, null, @"C:\Apps\Meltype", @"C:\Users\User\AppData\Local"));
+        Assert.Equal(@"D:\MeltypeData", AppPaths.ResolveDataDirectory(true, @"D:\MeltypeData", @"C:\Apps\Meltype", @"C:\Users\User\AppData\Local"), "開発用の上書き先は portable より優先");
+    }
+
+    [Test]
+    public static void Portable_StartupResetsModeToKeyboard()
+    {
+        var x64 = System.Runtime.InteropServices.Architecture.X64;
+        Assert.True(global::Meltype.Program.ShouldUseKeyboardOnStartup(new Settings { Mode = InputMode.Tsf }, isPortable: true, knownUnregistered: false, inUserLanguageList: true, x64), "ポータブル版は Meltype IME から戻す");
+        Assert.True(!global::Meltype.Program.ShouldUseKeyboardOnStartup(new Settings { Mode = InputMode.Keyboard }, isPortable: true, knownUnregistered: false, inUserLanguageList: true, x64), "キーボード方式は維持");
     }
 
     [Test]
@@ -344,7 +426,7 @@ internal static class WindowsTests
     [Test]
     public static void SettingsForm_UsesToggleSwitchesForEveryOnOffSetting()
     {
-        using var engine = new MeltypeEngine(new Settings(), null, null, null);
+        using var engine = new MeltypeEngine(new Settings(), null, null);
         using var form = new UI.SettingsForm(engine);
         var controls = Descendants(form).ToList();
         // 設定画面に出す bool の項目は、すべてスイッチ (ON/OFF だけのプルダウン・チェックボックスを残さない)
@@ -354,7 +436,7 @@ internal static class WindowsTests
         Assert.Equal(settings + 2, controls.OfType<UI.ToggleSwitch>().Count(), "ON/OFF の設定 + 上の表示オプション 2 つ");
         Assert.True(!controls.OfType<ComboBox>().Any(c => c.Items.Count == 2 && c.Items.Contains("ON")), "ON/OFF だけのプルダウンが残っていない");
         Assert.True(!controls.OfType<CheckBox>().Any(), "チェックボックスが残っていない");
-        // 表の ON/OFF の列 (アプリ別設定の「自動切替」・独自の種類の「最初は英数」) もスイッチで、値は bool
+        // 表の ON/OFF の列 (アプリ別設定の「有効」・独自の種類の「最初は英数」) もスイッチで、値は bool
         var columns = controls.OfType<DataGridView>().SelectMany(g => g.Columns.Cast<DataGridViewColumn>()).ToList();
         Assert.Equal(2, columns.OfType<UI.ToggleSwitchColumn>().Count(), "表のスイッチの列");
         Assert.True(!columns.OfType<DataGridViewComboBoxColumn>().Any(c => c.Items.Count == 2 && c.Items.Contains("ON")), "表に ON/OFF だけのプルダウンの列が残っていない");

@@ -40,6 +40,8 @@ class SyntheticClient:
         value = text.get_text()
         self.document += value
         self.commits.append(value)
+        # 実際のクライアント (GTK / Qt / Chromium) は commit-text で変換中の表示を消す
+        self.preedit = ""
 
     def preedit_updated(self, context, text, cursor, visible, *mode):
         self.preedit = text.get_text() if visible else ""
@@ -115,6 +117,7 @@ class PrivateDaemonTests(unittest.TestCase):
         cls.client = SyntheticClient()
         for name, callback in (("commit-text", cls.client.committed),
                                ("update-preedit-text", cls.client.preedit_updated),
+                               ("update-preedit-text-with-mode", cls.client.preedit_updated),
                                ("hide-preedit-text", cls.client.preedit_hidden),
                                ("update-lookup-table", cls.client.lookup_updated),
                                ("hide-lookup-table", cls.client.lookup_hidden),
@@ -286,6 +289,18 @@ class PrivateDaemonTests(unittest.TestCase):
         self.assertTrue(self.key(self.IBus.KEY_Return))
         self.assert_document("今日")
 
+    def test_ctrl_enter_during_composition_commits_without_sending(self):
+        control = self.IBus.ModifierType.CONTROL_MASK
+        self.type_text("kyouha")
+        self.assertTrue(self.key(self.IBus.KEY_Return, None, control),
+                        "変換中の Ctrl+Enter はアプリへ渡さない")
+        self.assert_document("きょうは")
+        self.assertEqual(["きょうは"], self.client.commits)
+        self.assertFalse(self.key(self.IBus.KEY_Return, None, control),
+                         "確定後の Ctrl+Enter はアプリへ渡す (アプリが送信できる)")
+        self.assert_document("きょうは")
+        self.assertEqual(["きょうは"], self.client.commits, "2回目は何も確定しない")
+
     def test_focus_out_commits_once(self):
         self.type_text("@kuraido")
         self.context.focus_out()
@@ -294,6 +309,107 @@ class PrivateDaemonTests(unittest.TestCase):
         self.pump(0.2)
         self.assert_document("@kuraido")
         self.assertEqual(["@kuraido"], self.client.commits)
+
+    def test_reset_during_composition_commits_once(self):
+        for client_commits in (False, True):
+            with self.subTest(client_commit_preedit=client_commits):
+                self.context.set_client_commit_preedit(client_commits)
+                try:
+                    self.reset_client()
+                    self.type_text("kyouha")
+                    shown = self.client.preedit
+                    self.assertTrue(shown, self.client.describe())
+                    if client_commits:
+                        # このモードでは実クライアントが Reset 前に表示をローカルで確定する。
+                        self.client.document += shown
+                        self.client.preedit = ""
+                    self.context.reset()
+                    self.pump(0.2)
+                    self.context.reset()
+                    self.pump(0.1)
+                    self.assert_document(shown)
+                    self.assertEqual([] if client_commits else [shown], self.client.commits)
+                    self.context.focus_out()
+                    self.pump()
+                    self.context.focus_in()
+                    self.pump()
+                    self.type_text("ka")
+                    self.assertTrue(self.key(self.IBus.KEY_Return))
+                    self.assert_document(shown + "か")
+                finally:
+                    self.context.set_client_commit_preedit(False)
+                    self.pump()
+
+    def test_reset_commits_the_text_that_would_be_committed(self):
+        # 表示と確定が違う入力 (語末の n)。IBus は Reset で「表示中の preedit」を確定するので、
+        # 表示が「かn」のままだと文書に「かn」が入り、本体が確定した「かん」とずれる。
+        for client_commits in (False, True):
+            with self.subTest(client_commit_preedit=client_commits):
+                self.context.set_client_commit_preedit(client_commits)
+                try:
+                    self.reset_client()
+                    self.type_text("kan")
+                    shown = self.client.preedit
+                    # 確定される形が表示されていること (ここが「かn」だと文書と本体がずれる)
+                    self.assertEqual("かん", shown, self.client.describe())
+                    if client_commits:
+                        # このモードでは実クライアントが Reset のときに表示をローカルで確定する。
+                        self.client.document += shown
+                        self.client.preedit = ""
+                    self.context.reset()
+                    self.pump(0.3)
+                    self.assert_document("かん")
+                    self.assertEqual([] if client_commits else ["かん"], self.client.commits,
+                                     self.client.describe())
+                finally:
+                    self.context.set_client_commit_preedit(False)
+                    self.pump()
+
+    def test_focus_out_commits_the_text_that_would_be_committed(self):
+        for client_commits in (False, True):
+            with self.subTest(client_commit_preedit=client_commits):
+                self.context.set_client_commit_preedit(client_commits)
+                try:
+                    self.reset_client()
+                    self.type_text("shinbun")
+                    shown = self.client.preedit
+                    self.assertEqual("しんぶん", shown, self.client.describe())
+                    if client_commits:
+                        self.client.document += shown
+                        self.client.preedit = ""
+                    self.context.focus_out()
+                    self.pump(0.3)
+                    self.assert_document("しんぶん")
+                    self.assertEqual([] if client_commits else ["しんぶん"], self.client.commits,
+                                     self.client.describe())
+                finally:
+                    self.context.set_client_commit_preedit(False)
+                    self.context.focus_in()
+                    self.pump()
+
+    def test_reset_selected_candidate_commits_once(self):
+        self.type_text("kyou")
+        self.assertTrue(self.key(self.IBus.KEY_space))
+        self.assertTrue(self.client.candidates, self.client.describe())
+        shown = self.client.preedit
+        self.context.reset()
+        self.pump(0.2)
+        self.assert_document(shown)
+        self.assertEqual([shown], self.client.commits)
+        self.assertEqual([], self.client.candidates)
+
+    def test_reset_after_enter_does_not_commit_again(self):
+        self.type_text("kyouha")
+        self.assertTrue(self.key(self.IBus.KEY_Return))
+        commits = list(self.client.commits)
+        document = self.client.document
+        self.context.reset()
+        self.pump(0.2)
+        self.context.focus_out()
+        self.context.focus_in()
+        self.pump(0.2)
+        self.assert_document(document)
+        self.assertEqual(commits, self.client.commits)
 
     def mixed_protection(self, action):
         for token in ("@kuraido", "./shumire-shon"):

@@ -11,8 +11,9 @@ foreach ($folderName in 'Startup', 'Programs') {
     $shortcut = Join-Path ([Environment]::GetFolderPath($folderName)) 'Meltype.lnk'
     if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force }
 }
-# サインインしたらすぐ起動するタスク (Meltype が作る: #283)
-& cmd.exe /c 'schtasks.exe /Delete /TN Meltype /F >nul 2>&1'
+# サインインしたらすぐ起動するタスク (Meltype が作る: #283)。PATH に System32 が無い PC もあるので、フルパスで起動する
+$system = [Environment]::SystemDirectory
+& "$system\cmd.exe" /c "`"$system\schtasks.exe`" /Delete /TN Meltype /F >nul 2>&1"
 Get-Process Meltype, meltype_mozc_helper -ErrorAction SilentlyContinue | Stop-Process -Force
 . (Join-Path $PSScriptRoot 'packaging\meltype-ime.ps1')
 if (-not (Uninstall-MeltypeIme)) {

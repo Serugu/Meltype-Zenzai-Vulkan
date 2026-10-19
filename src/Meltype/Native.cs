@@ -12,7 +12,7 @@ internal static class Native
     public const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
     public const int WM_LBUTTONDOWN = 0x0201, WM_RBUTTONDOWN = 0x0204, WM_MBUTTONDOWN = 0x0207, WM_XBUTTONDOWN = 0x020B;
     public const int WM_MOUSEWHEEL = 0x020A;
-    public const int WM_QUIT = 0x0012, WM_INPUTLANGCHANGEREQUEST = 0x0050, WM_IME_CONTROL = 0x0283;
+    public const int WM_QUIT = 0x0012, WM_IME_CONTROL = 0x0283;
     public const uint LLKHF_EXTENDED = 0x01, LLKHF_INJECTED = 0x10, LLKHF_UP = 0x80;
     public const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002;
     public const uint INPUT_KEYBOARD = 1;
@@ -21,7 +21,6 @@ internal static class Native
     public const uint WINEVENT_OUTOFCONTEXT = 0x0000, WINEVENT_SKIPOWNPROCESS = 0x0002;
 
     public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
-    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
     public delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -72,24 +71,8 @@ internal static class Native
     [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string? moduleName);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    /// <summary>このプロセスにコンソール窓があるか (ターミナルから起動した Exe か)。</summary>
-    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-    /// <summary>コンソールを外す (常駐 GUI 起動時に黒い窓を消す)。</summary>
-    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
-    /// <summary>このコンソールに繋がっているプロセス数 (親シェルと共有なら 2 以上)。</summary>
-    [DllImport("kernel32.dll", SetLastError = true)] public static extern uint GetConsoleProcessList(uint[] processList, uint count);
-
-    /// <summary>
-    /// 親のターミナル (cmd / PowerShell) とコンソールを共有しているか。
-    /// エクスプローラー起動など、Windows がこのプロセス専用にコンソールを付けた場合は false。
-    /// </summary>
-    public static bool SharesConsoleWithParent()
-    {
-        if (GetConsoleWindow() == IntPtr.Zero) return false;
-        // 要素 1 つだけ渡すと「足りない」ときに実際の数が返る。2 以上なら親と共有。
-        var count = GetConsoleProcessList(new uint[1], 1);
-        return count > 1;
-    }
+    /// <summary>親プロセスのコンソールにつなぐ (WinExe の --version など)。ATTACH_PARENT_PROCESS = 0xFFFFFFFF。</summary>
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint processId);
 
     [DllImport("user32.dll")] public static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
     [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG msg);
@@ -127,10 +110,6 @@ internal static class Native
     public const uint OBJID_CARET = 0xFFFFFFF8;
     [DllImport("oleacc.dll")] public static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint objectId, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out object? accessible);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-    public const int DWMWA_CLOAKED = 14;
-    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int max);
@@ -141,7 +120,6 @@ internal static class Native
 
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int InternalGetWindowText(IntPtr hwnd, [Out] char[] text, int max);
-    [DllImport("user32.dll")] public static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[]? list);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("imm32.dll")] public static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hwnd);
@@ -169,4 +147,9 @@ internal static class Native
     public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, TOKEN_QUERY = 0x0008;
     public const int TokenElevation = 20;
     public const uint MONITOR_DEFAULTTONEAREST = 2;
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT point, uint flags);
+    /// <summary>モニターの DPI (dpiType 0 = MDT_EFFECTIVE_DPI: 拡大率を反映した値)。Windows 8.1 以降。</summary>
+    [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr monitor, int dpiType, out uint dpiX, out uint dpiY);
+    /// <summary>システムの DPI (サインインしたときのメインのモニターの DPI)。Windows 10 1607 以降。</summary>
+    [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
 }
