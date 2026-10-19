@@ -1,6 +1,6 @@
 # Zenzai (ニューラル変換) — zenzai ブランチ
 
-Windows 版の Meltype (上流の v1.2.2-pre.2 を取り込み済み) に、azooKey の「Zenzai」で使われているかな漢字変換モデル **zenz** を足したものです。
+Windows 版の Meltype (上流の v1.3.0 を取り込み済み) に、azooKey の「Zenzai」で使われているかな漢字変換モデル **zenz** を足したものです。
 Mozc が出した文節ごとの候補から、zenz が文全体と前後の文の流れに合う組み合わせを選び直します。
 Space で変換したときは、zenz に候補に縛られず変換もさせ、読みを Microsoft IME の逆変換で確かめられたら使います (Mozc の候補に無い答えを拾う)。
 
@@ -114,7 +114,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\Install-Zenzai.ps1 -Enable
 ```
 
 - `Meltype.dll`・`Meltype.Core.dll` を入れ替え、`zenz\` にヘルパーを置き (前の版の `zenz\` はごみ箱へ送ります)、重みが無ければ取ってきます (管理者権限は要りません)
-- 版は `1.2.1-zenzai` になり、公式の自動更新では上書きされません
+- 版は `<上流の版>-zenzai` (`src/Meltype/Meltype.csproj` の `InformationalVersion`) になり、公式の自動更新では上書きされません
 - 戻すときは `-Restore` (公式の DLL に戻し、`zenz\` をごみ箱へ送ります)
 
 設定 (トレイの「設定」→「1. 全般」): 「Zenzai (ニューラル変換)」「Zenzai の計算に使う装置」「Zenzai を休ませるまでの時間 (分)」「Zenzai を待つ時間 (ms)」。

@@ -31,6 +31,20 @@
     </ItemGroup>
   </Target>
 
+  <!--
+    Vulkan 版の ggml.dll は ggml-cpu.dll を読み込むが、Vulkan のパッケージには入っていない。
+    LLamaSharp は CPU に合う版 (native\avx2\ など) の ggml-cpu.dll を先に読んでおくが、上で AVX-512 版と AVX 版を除いたので、
+    AVX-512 や AVX だけの CPU では見つからず、llama.dll が読めずに黙って CPU 版に戻る (READY cpu になる)。
+    そのため vulkan\ にも置く。どの CPU でも動く AVX なし版にする (層はすべて GPU で計算するので、速さは AVX2 版と変わらなかった)。
+    AVX2 の CPU では、LLamaSharp が先に読んだ avx2\ の ggml-cpu.dll が使われる。
+  -->
+  <Target Name="AddCpuLibraryForVulkan" AfterTargets="DropUnusedLlamaRuntimes" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <_NoAvxGgmlCpu Include="@(Content)" Condition="$([System.String]::Copy('%(Content.Link)').EndsWith('native\noavx\ggml-cpu.dll'))" />
+      <Content Include="@(_NoAvxGgmlCpu)" Link="$([System.String]::Copy('%(_NoAvxGgmlCpu.Link)').Replace('native\noavx\', 'native\vulkan\'))" />
+    </ItemGroup>
+  </Target>
+
   <ItemGroup>
     <PackageReference Include="LLamaSharp" Version="0.30.0" />
     <PackageReference Include="LLamaSharp.Backend.Cpu" Version="0.30.0" />
