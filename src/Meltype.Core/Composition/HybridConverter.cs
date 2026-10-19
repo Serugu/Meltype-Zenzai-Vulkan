@@ -23,6 +23,22 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     /// </summary>
     public float FreeMargin { get; set; } = 1f;
 
+    /// <summary>
+    /// 自由な変換の読みの確かめ方 (測るときに切り替える)。候補で作れるかを先に見ると、逆変換だけより AJIMEE-Bench と
+    /// tools/zenzai-*.txt の 320 問で 266 → 270 問正解 (差 1。答えが変わった 17 問で、正解から外れたものは無し)。
+    /// </summary>
+    public FreeCheck FreeCheckMode { get; set; } = FreeCheck.CandidatesOrReading;
+
+    public enum FreeCheck
+    {
+        /// <summary>漢字の読みを逆変換で確かめる (逆変換の読み違いで、正しい答えも捨てることがある: 橋 → ばし)。</summary>
+        Reading,
+        /// <summary>Mozc の文節ごとの候補でつなげて作れるか (作れれば読みは合っている) を先に見て、だめなら逆変換で確かめる。</summary>
+        CandidatesOrReading,
+        /// <summary>確かめない (読みと違う文も使ってしまう。測るときの上限)。</summary>
+        None,
+    }
+
     // zenz に渡す前後の文 (変換ボックスが変換を頼む前に入れる。Mozc に渡す文脈より長い)
     private string? _before, _after;
 
@@ -83,7 +99,7 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
             if (picks[i] >= candidates[i].Count) return null;
             clauses.Add(new ConversionClause(segments[i].Reading, candidates[i][picks[i]]));
         }
-        return Live ? clauses : WithFreeConversion(left, hiragana, clauses) ?? clauses;
+        return Live ? clauses : WithFreeConversion(left, hiragana, clauses, segments) ?? clauses;
     }
 
     /// <summary>
@@ -91,12 +107,56 @@ public sealed class HybridConverter(Func<ConversionEngine> engine, MozcConverter
     /// 漢字の部分の読みを逆変換 (Microsoft IME) で確かめ、読みが合い、zenz の点数が選び直しの答えより FreeMargin 以上高ければ使う。
     /// 使わないときは null。
     /// </summary>
-    private List<ConversionClause>? WithFreeConversion(string? left, string hiragana, List<ConversionClause> chosen)
+    private List<ConversionClause>? WithFreeConversion(string? left, string hiragana, List<ConversionClause> chosen,
+        IReadOnlyList<(string Reading, IReadOnlyList<string> Candidates)> segments)
     {
         if (readingOf is null || FreeMargin >= float.MaxValue) return null;
         var baseline = string.Concat(chosen.Select(c => c.Text));
         if (zenzai!.Generate(left, hiragana, _after, baseline) is not { } free || free.Text == baseline || free.Score < free.BaselineScore + FreeMargin) return null;
-        return AlignFree(free.Text, hiragana, chosen.Select(c => c.Reading).ToList(), readingOf);
+        var readings = chosen.Select(c => c.Reading).ToList();
+        return FreeCheckMode switch
+        {
+            FreeCheck.CandidatesOrReading => AlignToCandidates(segments, free.Text) ?? AlignFree(free.Text, hiragana, readings, readingOf),
+            FreeCheck.None => AlignToCandidates(segments, free.Text) ?? AlignFree(free.Text, hiragana, readings, readingOf) ?? [new ConversionClause(hiragana, free.Text)],
+            _ => AlignFree(free.Text, hiragana, readings, readingOf),
+        };
+    }
+
+    /// <summary>
+    /// text を、Mozc の文節ごとに候補を 1 つずつ選んでつなげて作れるなら、Mozc の文節の区切りで返す (作れなければ null)。
+    /// 候補はどれもその文節の読みの変換なので、作れれば読みは合っている (逆変換で確かめなくてよい)。順位の高い候補から試す。
+    /// 文節の読みに半角の英数字があれば、CompositionController と同じく半角にそろえて比べる。
+    /// 助詞だけの文節 (に・で など) は、かなでしか作らない (CompositionController がかなに戻すので、2 などにすると表示が text と違ってしまう)。
+    /// </summary>
+    internal static List<ConversionClause>? AlignToCandidates(IReadOnlyList<(string Reading, IReadOnlyList<string> Candidates)> segments, string text)
+    {
+        var lists = segments.Select(s => CompositionController.Particles.Contains(s.Reading)
+            ? [s.Reading]
+            : (s.Candidates.Count > 0 ? s.Candidates : [s.Reading]).Select(c => CompositionController.NormalizeHalfWidth(c, s.Reading)).ToList()).ToList();
+        var chosen = new string[segments.Count];
+        var dead = new HashSet<(int Segment, int Position)>();
+        return Fill(0, 0) ? segments.Select((s, i) => new ConversionClause(s.Reading, chosen[i])).ToList() : null;
+
+        // segment 番目から後ろの文節で、text の position 文字目から後ろを作れるか (作れなかった組は覚えて、もう試さない)
+        bool Fill(int segment, int position)
+        {
+            if (segment == segments.Count) return position == text.Length;
+            if (dead.Contains((segment, position))) return false;
+            var reading = segments[segment].Reading;
+            var ascii = reading.Any(char.IsAsciiLetterOrDigit);
+            foreach (var candidate in lists[segment])
+            {
+                if (candidate.Length == 0 || position + candidate.Length > text.Length) continue;
+                var matches = ascii
+                    ? CompositionController.NormalizeHalfWidth(text.Substring(position, candidate.Length), reading) == candidate
+                    : text.AsSpan(position, candidate.Length).SequenceEqual(candidate);
+                if (!matches || !Fill(segment + 1, position + candidate.Length)) continue;
+                chosen[segment] = candidate;
+                return true;
+            }
+            dead.Add((segment, position));
+            return false;
+        }
     }
 
     /// <summary>

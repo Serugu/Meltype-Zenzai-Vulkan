@@ -2014,7 +2014,7 @@ public sealed class CompositionController
 
     private static readonly char[] SentenceEnds = ['。', '．', '！', '？', '\n', '\r'];
 
-    private static readonly HashSet<string> Particles = ["は", "が", "を", "に", "で", "と", "も", "へ", "の", "や", "か", "から", "まで", "より"];
+    internal static readonly HashSet<string> Particles = ["は", "が", "を", "に", "で", "と", "も", "へ", "の", "や", "か", "から", "まで", "より"];
 
     private static bool IsSymbolOnly(string text) => text.Length > 0 && !text.Any(char.IsLetterOrDigit);
 

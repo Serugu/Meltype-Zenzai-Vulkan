@@ -27,31 +27,42 @@ internal static class ZenzaiFreeCheck
         foreach (var file in files)
         {
             var rows = File.ReadAllLines(file).Select(l => l.Split('\t')).Where(f => f.Length >= 4).ToList();
-            var correct = new int[Margins.Length];
-            var used = new int[Margins.Length];
+            var checks = Enum.GetValues<HybridConverter.FreeCheck>();
+            var correct = new int[checks.Length, Margins.Length];
+            var used = new int[checks.Length, Margins.Length];
             var examples = new List<string>();
             foreach (var fields in rows)
             {
                 var (left, reading, answers) = (fields[0], fields[1], fields[3].Split('|'));
                 var right = fields.Length > 4 ? fields[4] : "";
                 string? beam = null;
-                for (var m = 0; m < Margins.Length; m++)
+                for (var k = 0; k < checks.Length; k++)
                 {
-                    hybrid.FreeMargin = Margins[m];
-                    hybrid.SetSurroundings(left.Length > 0 ? left : null, right.Length > 0 ? right : null);
-                    // Mozc には Meltype と同じく 10 文字の文脈
-                    var text = string.Concat(hybrid.ConvertClauses(reading, left.Length > 0 ? left[^Math.Min(10, left.Length)..] : null)?.Select(c => c.Text) ?? [reading]);
-                    if (m == 0) beam = text;
-                    else if (text != beam) used[m]++;
-                    if (answers.Contains(text)) correct[m]++;
-                    if (m == 3 && text != beam && examples.Count < 20) examples.Add($"  {(answers.Contains(text) ? "+" : answers.Contains(beam) ? "-" : "x")} {reading}: 選び直し={beam}  自由={text}  (正解 {answers[0]})");
+                    hybrid.FreeCheckMode = checks[k];
+                    for (var m = 0; m < Margins.Length; m++)
+                    {
+                        hybrid.FreeMargin = Margins[m];
+                        hybrid.SetSurroundings(left.Length > 0 ? left : null, right.Length > 0 ? right : null);
+                        // Mozc には Meltype と同じく 10 文字の文脈
+                        var text = string.Concat(hybrid.ConvertClauses(reading, left.Length > 0 ? left[^Math.Min(10, left.Length)..] : null)?.Select(c => c.Text) ?? [reading]);
+                        if (m == 0) beam ??= text;
+                        else if (text != beam) used[k, m]++;
+                        if (answers.Contains(text)) correct[k, m]++;
+                        if (checks[k] == HybridConverter.FreeCheck.CandidatesOrReading && m == 2 && text != beam && examples.Count < 20)
+                            examples.Add($"  {(answers.Contains(text) ? "+" : answers.Contains(beam) ? "-" : "x")} {reading}: 選び直し={beam}  自由={text}  (正解 {answers[0]})");
+                    }
                 }
             }
             Console.WriteLine($"== {Path.GetFileName(file)} ({rows.Count} 問)");
-            for (var m = 0; m < Margins.Length; m++)
+            for (var k = 0; k < checks.Length; k++)
             {
-                Console.WriteLine($"  {(Margins[m] == float.MaxValue ? "自由な変換なし" : $"差 {Margins[m]}"),-14} 正解 {correct[m]}  自由な変換を使った {used[m]}");
+                for (var m = 0; m < Margins.Length; m++)
+                {
+                    if (k > 0 && m == 0) continue;
+                    Console.WriteLine($"  {checks[k],-20} {(Margins[m] == float.MaxValue ? "自由な変換なし" : $"差 {Margins[m]}"),-14} 正解 {correct[k, m]}  自由な変換を使った {used[k, m]}");
+                }
             }
+            Console.WriteLine("  (CandidatesOrReading・差 1 で、選び直しと答えが変わった問題)");
             foreach (var example in examples) Console.WriteLine(example);
         }
         return 0;

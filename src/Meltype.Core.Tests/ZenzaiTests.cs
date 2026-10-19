@@ -54,6 +54,23 @@ internal static class ZenzaiTests
     }
 
     [Test]
+    public static void AlignToCandidates_UsesOnlyMozcCandidates()
+    {
+        static string Joined(List<ConversionClause>? clauses) => clauses is null ? "(null)" : string.Join("|", clauses.Select(c => $"{c.Reading}={c.Text}"));
+        // Mozc の文節ごとの候補でつなげて作れれば、その区切りで返す (候補はその読みの変換なので、読みは合っている)
+        IReadOnlyList<(string, IReadOnlyList<string>)> segments = [("はしを", ["橋を", "箸を", "端を"]), ("わたる", ["渡る", "亘る"])];
+        Assert.Equal("はしを=端を|わたる=渡る", Joined(HybridConverter.AlignToCandidates(segments, "端を渡る")));
+        Assert.True(HybridConverter.AlignToCandidates(segments, "嘴を渡る") is null, "候補に無い字は使わない");
+        Assert.True(HybridConverter.AlignToCandidates(segments, "橋を渡るよ") is null, "余る文字があれば使わない");
+        // 助詞だけの文節は、かなでしか作らない (2 にすると、助詞をかなに戻す決まりで 荷物をに階に になる)
+        IReadOnlyList<(string, IReadOnlyList<string>)> cargo = [("にもつを", ["荷物を"]), ("に", ["に", "2", "二"]), ("かいに", ["階に", "回に"]), ("はこぶ", ["運ぶ"])];
+        Assert.True(HybridConverter.AlignToCandidates(cargo, "荷物を2階に運ぶ") is null, "助詞の文節を数字にしない");
+        // 半角の数字の読みは、Mozc の全角の候補を半角にそろえて比べる
+        IReadOnlyList<(string, IReadOnlyList<string>)> digits = [("15にちに", ["１５日に", "十五日に"]), ("きた", ["来た", "着た"])];
+        Assert.Equal("15にちに=15日に|きた=着た", Joined(HybridConverter.AlignToCandidates(digits, "15日に着た")));
+    }
+
+    [Test]
     public static void Reranker_WithoutHelper_FallsBackToMozc()
     {
         var reranker = new ZenzaiReranker(Path.Combine(Path.GetTempPath(), "no-such-dir", "Meltype.Zenz.exe"),

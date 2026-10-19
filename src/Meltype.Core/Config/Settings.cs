@@ -883,6 +883,7 @@ public sealed class Settings
         // 数値で書いた config.json の、今は無い番号 (消した IME 自動切替・両方を判定) は初期値にする
         if (!Enum.IsDefined(Mode)) Mode = InputMode.Tsf;
         if (!Enum.IsDefined(InputStyle)) InputStyle = InputStyle.Romaji;
+        if (!Enum.IsDefined(ZenzaiBackend)) ZenzaiBackend = ZenzaiBackend.Vulkan;
         AppRules ??= [];
         AppKinds ??= [];
         AppRules.RemoveAll(r => r is null || string.IsNullOrWhiteSpace(r.Process));

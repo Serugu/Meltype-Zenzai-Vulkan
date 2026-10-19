@@ -77,6 +77,15 @@ internal static class SettingsJsonTests
     }
 
     [Test]
+    public static void Normalize_UnknownZenzaiBackend_FallsBackToDefault()
+    {
+        // 数値で書いた config.json の、知らない番号の「Zenzai の計算に使う装置」は既定 (Vulkan) にする (Mode・InputStyle と同じ)
+        var settings = new Settings { ZenzaiBackend = (ZenzaiBackend)99 }.Normalize();
+        Assert.Equal(ZenzaiBackend.Vulkan, settings.ZenzaiBackend);
+        Assert.Equal(ZenzaiBackend.Cpu, new Settings { ZenzaiBackend = ZenzaiBackend.Cpu }.Normalize().ZenzaiBackend, "知っている値はそのまま");
+    }
+
+    [Test]
     public static void SettingsJson_ReadsRemovedChoicesAsCurrentOnes()
     {
         // 消した動作モード「IME 自動切替」は Meltype IME、消した入力方式「両方を判定」はローマ字入力として読む。
