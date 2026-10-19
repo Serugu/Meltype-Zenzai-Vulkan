@@ -940,19 +940,36 @@ public sealed partial class CompositionDetector
             var head = Raw(units, start, k);
             if (!head.All(char.IsAsciiLetter)) continue;
             if (lowerStart && !(head.Length >= 3 && IsKnownCapitalizedWord(head))) continue;
-            // 大文字の略語に小文字が続いた形 (AIde、AIni) は語ではない。略語 (AI) の後ろがローマ字 (dekiru) と見る (issue #129)
-            if (IsAcronymWithLowerTail(head)) continue;
+            // 大文字の略語に小文字が続いた形 (AIde、AIni) は語ではない。略語 (AI) の後ろがローマ字 (dekiru) と見る (issue #129)。
+            // ただし最後の大文字からが知っている語 (VPS + Hosting) なら、略語 + 語として下で助詞の前を見る
+            var acronymTail = IsAcronymWithLowerTail(head);
+            var acronymPlusWord = acronymTail && IsAcronymPlusWord(head);
+            if (acronymTail && !acronymPlusWord) continue;
             // 後ろは小文字のローマ字 (長音の - を含んでもよい: TSyu-za- の yu-za-)。
             var rest = Raw(units, k, n) + pending;
             // 後ろが助詞 1 つだけ (OCR|wo、English|ga) なら 2 文字でもよい
             if ((rest.Length < 3 && Detection.DictionaryDetector.StartsWithParticle(rest) != rest) || !rest.All(c => char.IsAsciiLetterLower(c) || c == '-') || !char.IsAsciiLetterLower(rest[0])) continue;
+            // 略語 + 語 (VPSHosting) は、後ろが助詞で始まり、語から後ろを続けてローマ字として読めない (hostingga) ときだけ区切る。
+            // 読めるなら、略語 + 日本語の名前 (JR + Takeshi、JR + Kanagawa) で、頭が英単語 (Take・Kana) になっているだけ。
+            // 語から後ろ全体が 1 つの英単語 (ABC + Cartoon、AWS + Keynote) なら、短い語 (Car・Key) で区切らない。
+            // 後ろは、ほかの語と同じく最後までローマ字として読めるときだけ (ABC + Red|mond を Redもんd にしない)
+            if (acronymPlusWord)
+            {
+                var upper = head.TakeWhile(char.IsAsciiLetterUpper).Count();
+                var wordAndRest = (head[(upper - 1)..] + rest).Replace("-", "");
+                var tailReading = _romaji.AnalyzeFragment(rest.Replace("-", ""));
+                if (Detection.DictionaryDetector.StartsWithParticle(rest) is not null && !_romaji.Analyze(wordAndRest.ToLowerInvariant()).IsValid &&
+                    tailReading.IsValid && !(final && tailReading.Partial.Length > 0 && tailReading.Partial != "n") &&
+                    !IsKnownCapitalizedWord(wordAndRest) && !(wordAndRest.Length >= 4 && IsSpellWord(wordAndRest.ToLowerInvariant()))) return k;
+                continue;
+            }
             // 知っている英単語・略語 (English、OCR) の後ろが助詞で始まるなら、その後ろに英単語が続いても (English|wo|happy) 区切る
             var knownHead = EndsWithAcronym(head) || head.Length >= 3 && IsKnownCapitalizedWord(head) || head.Length >= 4 && IsSpellWord(head.ToLowerInvariant());
             if (knownHead && Detection.DictionaryDetector.StartsWithParticle(rest) is not null) return k;
             var analysis = _romaji.AnalyzeFragment(rest.Replace("-", ""));
             if (!analysis.IsValid || (final && analysis.Partial.Length > 0 && analysis.Partial != "n")) continue;
             // 大文字で終わる略語 (OCR)、知っている語 (Tokyo)、スペルチェッカーの 4 文字以上の語 (English)
-            if (EndsWithAcronym(head) || head.Length >= 3 && IsKnownCapitalizedWord(head) || head.Length >= 4 && IsSpellWord(head.ToLowerInvariant())) return k;
+            if (knownHead) return k;
             // 大文字 1 文字 + 助詞で始まるローマ字 (A|nisiyouka → Aにしようか、B|noan → Bの案)。
             // 名前 (Tanaka、Hanako) を区切らないよう、後ろが助詞で始まるときだけ。
             if (head.Length == 1 && char.IsAsciiLetterUpper(head[0]) && Detection.DictionaryDetector.StartsWithParticle(rest.Replace("-", "")) is not null) return k;
@@ -995,6 +1012,20 @@ public sealed partial class CompositionDetector
         var upper = 0;
         while (upper < head.Length && char.IsAsciiLetterUpper(head[upper])) upper++;
         return upper >= 2 && upper < head.Length && head[upper..].All(char.IsAsciiLetterLower) && !IsKnownCapitalizedWord(head);
+    }
+
+    /// <summary>
+    /// 大文字 2 文字以上の略語の後ろに、大文字で始まる知っている語が続く (VPS + Hosting、EU + Hosting)。
+    /// 最後の大文字が語の頭で、語は 3 文字以上の英単語・固有名詞か、4 文字以上のスペルチェッカーの語。
+    /// IsAcronymWithLowerTail にも当たる形だが、略語 + ローマ字の打ち始め (AIde・GPTni、issue #129) とは分けて CapitalizedWordEnd で扱う。
+    /// </summary>
+    private bool IsAcronymPlusWord(string head)
+    {
+        var upper = 0;
+        while (upper < head.Length && char.IsAsciiLetterUpper(head[upper])) upper++;
+        if (upper < 3 || upper == head.Length || !head[upper..].All(char.IsAsciiLetterLower)) return false;
+        var word = head[(upper - 1)..];
+        return word.Length >= 3 && IsKnownCapitalizedWord(word) || word.Length >= 4 && IsSpellWord(word.ToLowerInvariant());
     }
 
     // - を付けて使う英語の接頭辞 (e-mail、re-do、co-op、x-ray)。接頭辞 + - + 3 文字以上の英単語なら英語。
