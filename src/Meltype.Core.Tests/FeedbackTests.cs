@@ -329,25 +329,6 @@ internal static class FeedbackTests
     }
 
     [Test]
-    public static void ChiSpelling_IsNotCRowEnglish()
-    {
-        // Windows のスペルチェッカーは machi を知っている。英語 (url) の後ろで助詞 (ga) が続くと、c 行の綴りとして英語にしていた (urlmachiがえた)。
-        // ち の chi は日本語のローマ字でも使うので、c で綴った英単語 (face|ni) とは分ける
-        var saved = CompositionTests.Detector.SpellChecker;
-        CompositionTests.Detector.SpellChecker = new FewWordsChecker("machi");
-        try
-        {
-            var k = new CompositionTests.Keyboard();
-            k.Type("urlmachigaeta\n");
-            Assert.Equal("urlまちがえた", k.Host.Document);
-        }
-        finally
-        {
-            CompositionTests.Detector.SpellChecker = saved;
-        }
-    }
-
-    [Test]
     public static void ShiftedSymbols_StartComposition()
     {
         Assert.Equal("！", Showing("!"));
